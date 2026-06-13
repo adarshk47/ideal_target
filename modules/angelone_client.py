@@ -79,6 +79,19 @@ def get_client():
         return None
 
 
+def is_connected() -> bool:
+    """Return True if a live authenticated AngelOne API session is active."""
+    # Trigger a connection attempt if not yet tried this run
+    if "angel_client_valid" not in st.session_state:
+        get_client()
+    return bool(st.session_state.get("angel_client_valid", False))
+
+
+def get_data_source() -> str:
+    """Return 'LIVE' if connected to AngelOne, otherwise 'DEMO'."""
+    return "LIVE" if is_connected() else "DEMO"
+
+
 def is_market_open() -> bool:
     """Check if NSE market is currently open (9:15 AM - 3:30 PM IST, Mon-Fri)."""
     now = datetime.now(IST)
@@ -184,26 +197,33 @@ def get_expiry_string(expiry_dt: datetime) -> str:
     return expiry_dt.strftime("%d%b%Y").upper()
 
 
+_EMPTY_CANDLES = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+
 @st.cache_data(ttl=10)
 def fetch_candle_data(interval_minutes: int = 1, lookback_bars: int = 200) -> pd.DataFrame:
     """
-    Fetch OHLCV candlestick data from AngelOne for NIFTY 50.
-    Falls back to simulated data if API is unavailable.
+    Fetch real OHLCV candlestick data from AngelOne for NIFTY 50.
+    When the market is closed, this returns the LAST trading day's session
+    (the API request window is widened to bridge weekends/holidays).
+    Returns an empty DataFrame if not connected — no simulated data.
     """
-    try:
-        obj = get_client()
-        if obj is None:
-            return _generate_mock_candles(interval_minutes, lookback_bars)
+    obj = get_client()
+    if obj is None:
+        return _EMPTY_CANDLES.copy()
 
+    try:
         interval_str = INTERVAL_MAP.get(interval_minutes, "ONE_MINUTE")
         now = datetime.now(IST)
-        # Look back enough bars
+
+        # Widen the window enough to always include the last completed session,
+        # even across a weekend or a string of holidays (look back up to 6 days),
+        # while still requesting enough history for the chosen interval.
         lookback_minutes = interval_minutes * lookback_bars
         from_dt = now - timedelta(minutes=lookback_minutes + 30)
-
-        # If market hasn't opened today, go back to last trading day
-        if now.hour < 9 or (now.hour == 9 and now.minute < 15):
-            from_dt = (now - timedelta(days=1)).replace(hour=9, minute=15, second=0)
+        earliest = now - timedelta(days=6)
+        if from_dt > earliest:
+            from_dt = earliest
 
         from_str = from_dt.strftime("%Y-%m-%d %H:%M")
         to_str = now.strftime("%Y-%m-%d %H:%M")
@@ -226,12 +246,12 @@ def fetch_candle_data(interval_minutes: int = 1, lookback_bars: int = 200) -> pd
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             df.dropna(inplace=True)
             return df
-        else:
-            return _generate_mock_candles(interval_minutes, lookback_bars)
+
+        return _EMPTY_CANDLES.copy()
 
     except Exception as e:
         logger.error(f"Candle data error: {e}")
-        return _generate_mock_candles(interval_minutes, lookback_bars)
+        return _EMPTY_CANDLES.copy()
 
 
 @st.cache_data(ttl=10)
@@ -239,7 +259,7 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
     """
     Fetch options chain data including greeks from AngelOne.
     Returns DataFrame with strike, CE/PE OI, volume, IV, delta, gamma, theta, vega.
-    Falls back to simulated data if API unavailable.
+    Returns an empty DataFrame if not connected — no simulated data.
     """
     try:
         if expiry_str is None:
@@ -248,7 +268,7 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
 
         obj = get_client()
         if obj is None:
-            return _generate_mock_options_chain()
+            return pd.DataFrame()
 
         response = obj.getOptionGreeks({"name": "NIFTY", "expirydate": expiry_str})
 
@@ -284,12 +304,12 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
             df.sort_values("strike", inplace=True)
             df.reset_index(drop=True, inplace=True)
             return df
-        else:
-            return _generate_mock_options_chain()
+
+        return pd.DataFrame()
 
     except Exception as e:
         logger.error(f"Options chain error: {e}")
-        return _generate_mock_options_chain()
+        return pd.DataFrame()
 
 
 def get_atm_strike(spot_price: float, step: int = 50) -> int:
@@ -303,134 +323,38 @@ def get_strike_range(spot_price: float, n: int = 5, step: int = 50) -> list:
     return [atm + i * step for i in range(-n, n + 1)]
 
 
-# ─── Mock / Simulation helpers ────────────────────────────────────────────────
-
-def _generate_mock_candles(interval_minutes: int = 1, bars: int = 200) -> pd.DataFrame:
-    """Generate realistic mock NIFTY candlestick data for demo/testing."""
-    np.random.seed(int(time.time() / 60))  # Changes every minute
-    now = datetime.now(IST).replace(tzinfo=None)
-
-    # Start from today's 9:15 AM or lookback
-    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    if now < market_open:
-        market_open = (now - timedelta(days=1)).replace(hour=9, minute=15, second=0, microsecond=0)
-
-    base_price = 22000.0 + np.random.uniform(-500, 500)
-    timestamps = []
-    opens, highs, lows, closes, volumes = [], [], [], [], []
-
-    price = base_price
-    for i in range(bars):
-        ts = market_open + timedelta(minutes=i * interval_minutes)
-        # Skip non-market hours
-        if ts.hour >= 15 and ts.minute > 30:
-            ts = (ts + timedelta(days=1)).replace(hour=9, minute=15)
-        if ts.weekday() >= 5:
-            ts += timedelta(days=(7 - ts.weekday()))
-
-        timestamps.append(ts)
-        o = price
-        change = np.random.normal(0, 0.3) * price / 100
-        c = o + change
-        h = max(o, c) + abs(np.random.normal(0, 0.15)) * price / 100
-        l = min(o, c) - abs(np.random.normal(0, 0.15)) * price / 100
-        v = int(np.random.randint(50000, 500000))
-        opens.append(round(o, 2))
-        highs.append(round(h, 2))
-        lows.append(round(l, 2))
-        closes.append(round(c, 2))
-        volumes.append(v)
-        price = c
-
-    df = pd.DataFrame({
-        "timestamp": timestamps,
-        "open": opens,
-        "high": highs,
-        "low": lows,
-        "close": closes,
-        "volume": volumes,
-    })
-    return df
-
-
-def _generate_mock_options_chain() -> pd.DataFrame:
-    """Generate mock options chain data around current NIFTY level."""
-    np.random.seed(int(time.time() / 30))
-    spot = 22000 + np.random.uniform(-300, 300)
-    atm = get_atm_strike(spot)
-    strikes = [atm + i * 50 for i in range(-10, 11)]
-
-    rows = []
-    for strike in strikes:
-        moneyness = (spot - strike) / spot
-        # Rough Black-Scholes approximations
-        ce_iv = max(10, 15 - moneyness * 100 + abs(moneyness) * 50)
-        pe_iv = max(10, 15 + moneyness * 100 + abs(moneyness) * 50)
-        ce_delta = max(0.01, min(0.99, 0.5 + moneyness * 5))
-        pe_delta = ce_delta - 1
-        ce_gamma = max(0.0001, 0.005 - abs(moneyness) * 0.02)
-        pe_gamma = ce_gamma
-        ce_theta = -max(1, 20 - abs(strike - atm) / 10)
-        pe_theta = -max(1, 20 - abs(strike - atm) / 10)
-        ce_vega = max(0.1, 5 - abs(moneyness) * 20)
-        pe_vega = ce_vega
-        ce_ltp = max(1, (spot - strike) * ce_delta + np.random.uniform(5, 50))
-        pe_ltp = max(1, (strike - spot) * abs(pe_delta) + np.random.uniform(5, 50))
-
-        ce_oi = int(max(100, np.random.normal(500000, 200000)))
-        pe_oi = int(max(100, np.random.normal(500000, 200000)))
-        # More OI near ATM
-        dist_factor = max(0.1, 1 - abs(strike - atm) / 500)
-        ce_oi = int(ce_oi * dist_factor)
-        pe_oi = int(pe_oi * dist_factor)
-
-        rows.append({
-            "strike": float(strike),
-            "ce_oi": ce_oi,
-            "ce_volume": int(ce_oi * 0.3 * np.random.uniform(0.5, 1.5)),
-            "ce_iv": round(ce_iv, 2),
-            "ce_delta": round(ce_delta, 4),
-            "ce_gamma": round(ce_gamma, 6),
-            "ce_theta": round(ce_theta, 2),
-            "ce_vega": round(ce_vega, 4),
-            "ce_ltp": round(ce_ltp, 2),
-            "ce_bid": round(ce_ltp * 0.99, 2),
-            "ce_ask": round(ce_ltp * 1.01, 2),
-            "pe_oi": pe_oi,
-            "pe_volume": int(pe_oi * 0.3 * np.random.uniform(0.5, 1.5)),
-            "pe_iv": round(pe_iv, 2),
-            "pe_delta": round(pe_delta, 4),
-            "pe_gamma": round(pe_gamma, 6),
-            "pe_theta": round(pe_theta, 2),
-            "pe_vega": round(pe_vega, 4),
-            "pe_ltp": round(pe_ltp, 2),
-            "pe_bid": round(pe_ltp * 0.99, 2),
-            "pe_ask": round(pe_ltp * 1.01, 2),
-        })
-
-    df = pd.DataFrame(rows)
-    df.sort_values("strike", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
+def _last_trading_day(ref: datetime) -> datetime:
+    """Return the most recent trading day (Mon–Fri) on or before ref's date."""
+    d = ref
+    # If before market open today, the latest completed session is the prior day
+    if d.weekday() >= 5:  # weekend -> roll back to Friday
+        d = d - timedelta(days=(d.weekday() - 4))
+    elif d.hour < 9 or (d.hour == 9 and d.minute < 15):
+        d = d - timedelta(days=1)
+        while d.weekday() >= 5:
+            d = d - timedelta(days=1)
+    return d
 
 
 @st.cache_data(ttl=5)
 def fetch_ltp(token: str = NIFTY_TOKEN) -> float:
-    """Fetch the Last Traded Price for NIFTY 50."""
-    try:
-        obj = get_client()
-        if obj is None:
-            # Return mock price
-            candles = fetch_candle_data(1, 2)
-            return float(candles["close"].iloc[-1]) if not candles.empty else 22000.0
+    """
+    Fetch the Last Traded Price for NIFTY 50 from AngelOne.
+    When the market is closed this returns the last traded price (last close).
+    Returns 0.0 if not connected — no simulated price.
+    """
+    obj = get_client()
+    if obj is None:
+        return 0.0
 
+    try:
         response = obj.ltpData(NIFTY_EXCHANGE, "NIFTY 50", token)
         if response and response.get("status"):
             return float(response["data"]["ltp"])
-        else:
-            candles = fetch_candle_data(1, 2)
-            return float(candles["close"].iloc[-1]) if not candles.empty else 22000.0
+        # Fall back to the last real candle close
+        candles = fetch_candle_data(1, 2)
+        return float(candles["close"].iloc[-1]) if not candles.empty else 0.0
     except Exception as e:
         logger.error(f"LTP fetch error: {e}")
         candles = fetch_candle_data(1, 2)
-        return float(candles["close"].iloc[-1]) if not candles.empty else 22000.0
+        return float(candles["close"].iloc[-1]) if not candles.empty else 0.0

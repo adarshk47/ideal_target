@@ -71,6 +71,7 @@ try:
         fetch_candle_data, fetch_options_chain, fetch_ltp,
         get_next_weekly_expiry, get_expiry_string, get_expiry_countdown,
         is_market_open, get_atm_strike, get_strike_range, INTERVAL_MAP,
+        is_connected, get_data_source,
     )
     from modules.pattern_detector import detect_all_patterns
     from modules.oi_analyzer import (
@@ -117,15 +118,39 @@ def color_bias(bias: str) -> str:
     return "neutral"
 
 
+def filter_to_latest_day(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the most recent trading day's candles (intraday view)."""
+    if df is None or df.empty:
+        return df
+    ts = pd.to_datetime(df["timestamp"])
+    last_date = ts.iloc[-1].date()
+    mask = ts.dt.date == last_date
+    return df[mask].reset_index(drop=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────────────────────
-def render_header(ltp: float, spot_prev: float):
+def render_header(ltp: float, spot_prev: float, connected: bool):
     now = get_now()
     expiry_dt = get_next_weekly_expiry()
     expiry_str = get_expiry_string(expiry_dt)
     countdown = get_expiry_countdown(expiry_dt)
     market_status = "🟢 MARKET OPEN" if is_market_open() else "🔴 MARKET CLOSED"
+
+    # ── Connection status badge (top-right) ──────────────────────────────────
+    if connected:
+        conn_html = ('<span style="background:#0d2818;color:#00ff88;border:1px solid #00ff88;'
+                     'border-radius:14px;padding:4px 14px;font-size:13px;font-weight:bold;">'
+                     '🟢 AngelOne · LIVE</span>')
+    else:
+        conn_html = ('<span style="background:#2a1010;color:#ff5555;border:1px solid #ff5555;'
+                     'border-radius:14px;padding:4px 14px;font-size:13px;font-weight:bold;">'
+                     '🔴 DEMO · Not connected to AngelOne</span>')
+    st.markdown(
+        f'<div style="display:flex;justify-content:flex-end;margin-bottom:6px;">{conn_html}</div>',
+        unsafe_allow_html=True,
+    )
     chg = ltp - spot_prev
     chg_pct = chg / spot_prev * 100 if spot_prev else 0
     chg_color = "#00ff88" if chg >= 0 else "#ff4444"
@@ -174,16 +199,68 @@ def render_header(ltp: float, spot_prev: float):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CHART HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _find_support_resistance(df: pd.DataFrame, left: int = 3, right: int = 3,
+                             max_levels: int = 3):
+    """
+    Detect swing-based support & resistance levels using local pivots,
+    then merge nearby levels and return the strongest few of each.
+    Returns (supports, resistances) as sorted lists of price floats.
+    """
+    highs = df["high"].values
+    lows = df["low"].values
+    n = len(df)
+    res_pivots, sup_pivots = [], []
+    for i in range(left, n - right):
+        win_h = highs[i - left:i + right + 1]
+        win_l = lows[i - left:i + right + 1]
+        if highs[i] >= win_h.max():
+            res_pivots.append(highs[i])
+        if lows[i] <= win_l.min():
+            sup_pivots.append(lows[i])
+
+    price = float(df["close"].iloc[-1]) or 1.0
+    tol = price * 0.0012  # ~0.12% clustering tolerance
+
+    def _cluster(levels):
+        if not levels:
+            return []
+        levels = sorted(levels)
+        clusters = [[levels[0]]]
+        for lv in levels[1:]:
+            if abs(lv - clusters[-1][-1]) <= tol:
+                clusters[-1].append(lv)
+            else:
+                clusters.append([lv])
+        # (avg_level, touches) — more touches = stronger
+        scored = [(sum(c) / len(c), len(c)) for c in clusters]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [round(lv, 2) for lv, _ in scored[:max_levels]]
+
+    return _cluster(sup_pivots), _cluster(res_pivots)
+
+
+def _pick_active_signal(selected):
+    """From the deduped (idx,(score,pat)) list pick the most recent signal."""
+    if not selected:
+        return None
+    # selected is sorted by bar index; last is most recent
+    return selected[-1][1][1]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CHART
 # ─────────────────────────────────────────────────────────────────────────────
 def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: int):
     if candle_df is None or candle_df.empty:
         fig = go.Figure()
         fig.update_layout(
-            title="No Data Available",
+            title="No data — connect to AngelOne (add API secrets) to load NIFTY candles",
             paper_bgcolor="#0e1117",
             plot_bgcolor="#0e1117",
             font_color="#fff",
+            height=520,
         )
         return fig
 
@@ -211,6 +288,58 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
         whiskerwidth=0.8,
     ), row=1, col=1)
 
+    # EMA 9 & EMA 21 overlays
+    if len(candle_df) >= 2:
+        ema9 = candle_df["close"].ewm(span=9, adjust=False).mean()
+        ema21 = candle_df["close"].ewm(span=21, adjust=False).mean()
+        fig.add_trace(go.Scatter(
+            x=candle_df["timestamp"], y=ema9, mode="lines",
+            line=dict(color="#ffaa00", width=1.4), name="EMA 9",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=candle_df["timestamp"], y=ema21, mode="lines",
+            line=dict(color="#33b5ff", width=1.4), name="EMA 21",
+        ), row=1, col=1)
+
+    # Support / Resistance levels
+    supports, resistances = _find_support_resistance(candle_df)
+    x0 = candle_df["timestamp"].iloc[0]
+    x1 = candle_df["timestamp"].iloc[-1]
+    for lv in resistances:
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[lv, lv], mode="lines",
+            line=dict(color="#ff6b6b", width=1, dash="dot"),
+            name="Resistance", legendgroup="sr", showlegend=False,
+            hovertemplate=f"Resistance {lv}<extra></extra>",
+        ), row=1, col=1)
+        fig.add_annotation(x=x1, y=lv, text=f"R {lv:.0f}", showarrow=False,
+                           xanchor="left", font=dict(color="#ff6b6b", size=9),
+                           row=1, col=1)
+    for lv in supports:
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[lv, lv], mode="lines",
+            line=dict(color="#4dd2a0", width=1, dash="dot"),
+            name="Support", legendgroup="sr", showlegend=False,
+            hovertemplate=f"Support {lv}<extra></extra>",
+        ), row=1, col=1)
+        fig.add_annotation(x=x1, y=lv, text=f"S {lv:.0f}", showarrow=False,
+                           xanchor="left", font=dict(color="#4dd2a0", size=9),
+                           row=1, col=1)
+
+    # Trend line — linear regression over the session (direction + slope)
+    if len(candle_df) >= 3:
+        y = candle_df["close"].values.astype(float)
+        x_idx = np.arange(len(y))
+        slope, intercept = np.polyfit(x_idx, y, 1)
+        y_fit = slope * x_idx + intercept
+        trend_up = slope >= 0
+        fig.add_trace(go.Scatter(
+            x=candle_df["timestamp"], y=y_fit, mode="lines",
+            line=dict(color="#00ff88" if trend_up else "#ff4444",
+                      width=1.6, dash="dash"),
+            name=f"Trend ({'UP' if trend_up else 'DOWN'})",
+        ), row=1, col=1)
+
     # Volume bars
     colors = ["#00cc66" if c >= o else "#cc2222"
               for c, o in zip(candle_df["close"], candle_df["open"])]
@@ -223,24 +352,43 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
         showlegend=False,
     ), row=2, col=1)
 
-    # Pattern annotations on chart
-    pattern_annotations = []
-    buy_x, buy_y, buy_text = [], [], []
-    sell_x, sell_y, sell_text = [], [], []
+    # Pattern markers — deduped & capped so the chart stays readable.
+    # Keep only the highest-confidence pattern per bar, then show the most
+    # recent ones (clutter from 40+ overlapping labels otherwise).
+    def _conf_score(p):
+        c = getattr(p, "confidence", 0.5)
+        if isinstance(c, str):
+            return {"HIGH": 1.0, "MEDIUM": 0.6, "LOW": 0.3}.get(c.upper(), 0.5)
+        return float(c)
 
+    best_per_bar = {}
     for pat in patterns:
         idx = getattr(pat, "index", getattr(pat, "bar_index", -1))
         if idx < 0 or idx >= len(candle_df):
             continue
+        score = _conf_score(pat) + min(float(pat.risk_reward or 0) / 10, 0.5)
+        if idx not in best_per_bar or score > best_per_bar[idx][0]:
+            best_per_bar[idx] = (score, pat)
+
+    # Most recent 10 bars with a pattern (sorted by bar index)
+    selected = sorted(best_per_bar.items())[-10:]
+
+    buy_x, buy_y, buy_text = [], [], []
+    sell_x, sell_y, sell_text = [], [], []
+    for idx, (_, pat) in selected:
         ts = candle_df["timestamp"].iloc[idx]
+        pname = getattr(pat, "pattern", getattr(pat, "name", str(pat)))
+        label = f"{pname} (RR {pat.risk_reward})"
+        # Stagger label offset using ATR-like spacing to avoid overlap
+        rng = float(candle_df["high"].iloc[idx] - candle_df["low"].iloc[idx]) or 5
         if pat.signal == "BUY":
             buy_x.append(ts)
-            buy_y.append(candle_df["low"].iloc[idx] - 5)
-            buy_text.append(f"{getattr(pat, 'pattern', pat.name if hasattr(pat,'name') else str(pat))}<br>RR: {pat.risk_reward}")
+            buy_y.append(candle_df["low"].iloc[idx] - rng * 0.8)
+            buy_text.append(label)
         else:
             sell_x.append(ts)
-            sell_y.append(candle_df["high"].iloc[idx] + 5)
-            sell_text.append(f"{getattr(pat, 'pattern', pat.name if hasattr(pat,'name') else str(pat))}<br>RR: {pat.risk_reward}")
+            sell_y.append(candle_df["high"].iloc[idx] + rng * 0.8)
+            sell_text.append(label)
 
     if buy_x:
         fig.add_trace(go.Scatter(
@@ -259,6 +407,41 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
             textfont=dict(size=9, color="#ff4444"),
             name="SELL Signal", showlegend=True,
         ), row=1, col=1)
+
+    # ── Entry / Stop-Loss / Target levels for the most recent signal ─────────
+    active = _pick_active_signal(selected)
+    if active is not None:
+        is_buy = active.signal == "BUY"
+        side_color = "#00ff88" if is_buy else "#ff4444"
+        levels = [
+            ("ENTRY", float(active.entry), "#ffffff"),
+            ("SL", float(active.stop_loss), "#ff5555"),
+            ("TARGET", float(active.target), "#00ff88"),
+        ]
+        for label, price_lv, lvl_color in levels:
+            fig.add_trace(go.Scatter(
+                x=[x0, x1], y=[price_lv, price_lv], mode="lines",
+                line=dict(color=lvl_color, width=1.3,
+                          dash="solid" if label == "ENTRY" else "dashdot"),
+                name=f"{label}", showlegend=False,
+                hovertemplate=f"{label} {price_lv:.2f}<extra></extra>",
+            ), row=1, col=1)
+            fig.add_annotation(
+                x=x1, y=price_lv, text=f"{label} {price_lv:.0f}",
+                showarrow=False, xanchor="left",
+                bgcolor="rgba(0,0,0,0.6)",
+                font=dict(color=lvl_color, size=10, family="monospace"),
+                row=1, col=1,
+            )
+        # Headline badge for the active trade
+        pname = getattr(active, "pattern", getattr(active, "name", "Signal"))
+        fig.add_annotation(
+            x=x0, y=candle_df["high"].max(),
+            text=f"▶ {active.signal} · {pname} · R:R 1:{active.risk_reward}",
+            showarrow=False, xanchor="left", yanchor="top",
+            bgcolor=side_color, font=dict(color="#0e1117", size=11),
+            row=1, col=1,
+        )
 
     # Layout
     fig.update_layout(
@@ -284,9 +467,13 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
     )
     fig.update_yaxes(gridcolor="#1e2130", showgrid=True)
 
-    # OI arrows
+    # OI arrows — append (do NOT replace existing S/R & entry/target labels)
     if oi_annotations:
-        fig.update_layout(annotations=oi_annotations)
+        for ann in oi_annotations:
+            try:
+                fig.add_annotation(ann)
+            except Exception:
+                pass
 
     return fig
 
@@ -672,8 +859,9 @@ def main():
     # Fetch core data
     ltp = fetch_ltp()
     spot_prev = ltp * 0.9985  # approximation for prev close display
+    connected = is_connected()
 
-    render_header(ltp, spot_prev)
+    render_header(ltp, spot_prev, connected)
 
     # Timeframe selector for chart
     tf_options = {1: "1 min", 2: "2 min", 5: "5 min", 10: "10 min",
@@ -689,8 +877,9 @@ def main():
             key="chart_tf_radio",
         )
 
-    # Fetch candle data for selected TF
+    # Fetch candle data for selected TF, then keep only the latest trading day
     candle_df = fetch_candle_data(selected_tf, 200)
+    candle_df = filter_to_latest_day(candle_df)
 
     # Fetch data for all timeframes (for OI table)
     candle_data_by_tf = {}
@@ -783,5 +972,5 @@ def main():
             st.caption("Install streamlit-autorefresh for auto-refresh")
 
 
-if __name__ == "__main__" or True:
+if __name__ == "__main__":
     main()

@@ -91,21 +91,75 @@ def is_market_open() -> bool:
 
 def get_next_weekly_expiry() -> datetime:
     """
-    Get the next weekly Nifty expiry date (every Tuesday).
-    If today is Tuesday and market is still open, return today.
+    Get the next weekly Nifty expiry date dynamically from AngelOne API.
+    Searches NFO scrips for NIFTY options and returns the nearest upcoming expiry.
+    Falls back to session_state cached value, then to nearest weekday if API unavailable.
     """
     now = datetime.now(IST)
     today = now.date()
-    # Tuesday = weekday 1
-    days_until_tuesday = (1 - today.weekday()) % 7
-    if days_until_tuesday == 0:
-        # Today is Tuesday
-        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        if now > market_close:
-            # Today's expiry has closed, get next Tuesday
-            days_until_tuesday = 7
-    expiry_date = today + timedelta(days=days_until_tuesday)
-    return datetime.combine(expiry_date, datetime.min.time()).replace(tzinfo=IST)
+
+    # Try AngelOne API first
+    try:
+        obj = get_client()
+        if obj is not None:
+            response = obj.searchScrip("NFO", "NIFTY")
+            if response and response.get("status") and response.get("data"):
+                expiry_dates = set()
+                for scrip in response["data"]:
+                    # Only weekly options (not monthly futures/options with far dates)
+                    name = scrip.get("tradingsymbol", "")
+                    expiry_str = scrip.get("expiry", "")
+                    if not expiry_str or "NIFTY" not in name:
+                        continue
+                    try:
+                        exp_date = datetime.strptime(expiry_str, "%d%b%Y").date()
+                        if exp_date >= today:
+                            expiry_dates.add(exp_date)
+                    except Exception:
+                        try:
+                            exp_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                            if exp_date >= today:
+                                expiry_dates.add(exp_date)
+                        except Exception:
+                            pass
+
+                if expiry_dates:
+                    # Pick the nearest upcoming expiry
+                    nearest = min(expiry_dates)
+                    # If nearest is today and market closed, pick the next one
+                    if nearest == today:
+                        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+                        if now > mkt_close and len(expiry_dates) > 1:
+                            nearest = sorted(expiry_dates)[1]
+                    expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
+                    # Cache for fallback use
+                    st.session_state["_last_known_expiry"] = expiry_dt
+                    return expiry_dt
+    except Exception as e:
+        logger.debug(f"Expiry fetch from API failed: {e}")
+
+    # Fallback 1: use last known expiry from session_state if still valid
+    cached = st.session_state.get("_last_known_expiry")
+    if cached is not None:
+        cached_date = cached.date() if hasattr(cached, "date") else cached
+        if cached_date >= today:
+            return cached
+
+    # Fallback 2: scan next 7 days — pick nearest weekday that is Mon–Fri
+    # (expiry is always a weekday; we don't know which day without API,
+    # so return the soonest non-weekend day within the next 7 days)
+    for delta in range(0, 8):
+        candidate = today + timedelta(days=delta)
+        if candidate.weekday() < 5:  # Mon=0 … Fri=4
+            if candidate == today:
+                mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+                if now <= mkt_close:
+                    return datetime.combine(candidate, datetime.min.time()).replace(tzinfo=IST)
+            else:
+                return datetime.combine(candidate, datetime.min.time()).replace(tzinfo=IST)
+
+    # Absolute fallback
+    return datetime.combine(today + timedelta(days=1), datetime.min.time()).replace(tzinfo=IST)
 
 
 def get_expiry_countdown(expiry_dt: datetime) -> str:

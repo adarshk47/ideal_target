@@ -163,48 +163,68 @@ def is_market_open() -> bool:
     return market_open <= now <= market_close
 
 
+def _nearest_future_expiry(expiries: list, now: datetime):
+    """Pick the nearest upcoming expiry from a list of dates, rolling past
+    today's expiry once the session has closed."""
+    today = now.date()
+    future = sorted(d for d in expiries if d >= today)
+    if not future:
+        return None
+    nearest = future[0]
+    if nearest == today:
+        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now > mkt_close and len(future) > 1:
+            nearest = future[1]
+    return nearest
+
+
 def get_next_weekly_expiry() -> datetime:
     """
-    Get the next weekly NIFTY expiry from the NFO scrip master (authoritative
-    list of all listed option expiries). Picks the nearest upcoming expiry.
-    Falls back to the cached value, else returns None so the UI shows '---'.
+    Get the next NIFTY weekly expiry. Source priority:
+      1. AngelOne authenticated searchScrip API (live, authoritative)
+      2. Public NFO scrip master file (when reachable)
+      3. Last known expiry cached this session
+      4. Calculated next weekly expiry weekday (Tuesday) as last resort
+    Returns a tz-aware datetime, or None so the UI shows '---'.
     """
     now = datetime.now(IST)
     today = now.date()
 
-    # Primary source: the public NFO scrip master (no auth needed, reliable)
+    # 1) Authoritative: ask AngelOne directly (works even if scrip master 404s)
     try:
-        expiries = _load_nifty_expiries()
-        future = sorted(d for d in expiries if d >= today)
-        if future:
-            nearest = future[0]
-            # If today is expiry and the session has closed, roll to the next
-            if nearest == today:
-                mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-                if now > mkt_close and len(future) > 1:
-                    nearest = future[1]
+        ao_expiries = _get_expiry_from_angelone()
+        nearest = _nearest_future_expiry(ao_expiries, now)
+        if nearest:
+            expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
+            st.session_state["_last_known_expiry"] = expiry_dt
+            return expiry_dt
+    except Exception as e:
+        logger.debug(f"AngelOne expiry discovery failed: {e}")
+
+    # 2) Public NFO scrip master
+    try:
+        nearest = _nearest_future_expiry(_load_nifty_expiries(), now)
+        if nearest:
             expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
             st.session_state["_last_known_expiry"] = expiry_dt
             return expiry_dt
     except Exception as e:
         logger.debug(f"Expiry fetch from scrip master failed: {e}")
 
-    # Fallback: use last known expiry from session_state if still valid
+    # 3) Last known expiry from session_state if still valid
     cached = st.session_state.get("_last_known_expiry")
     if cached is not None:
         cached_date = cached.date() if hasattr(cached, "date") else cached
         if cached_date >= today:
             return cached
 
-    # Last resort: calculate next Thursday mathematically (no holiday adjustment)
+    # 4) Last resort: calculate next weekly expiry weekday (Tuesday)
     try:
-        next_thu = _calc_next_thursday()
-        expiry_dt = datetime.combine(next_thu, datetime.min.time()).replace(tzinfo=IST)
-        return expiry_dt
+        next_exp = _calc_next_expiry_day()
+        return datetime.combine(next_exp, datetime.min.time()).replace(tzinfo=IST)
     except Exception:
         pass
 
-    # Truly no data available
     return None
 
 
@@ -290,10 +310,11 @@ def fetch_candle_data(interval_minutes: int = 1, lookback_bars: int = 200) -> pd
         return _EMPTY_CANDLES.copy()
 
 
-# Scrip master URLs to try in order (AngelOne rebranded from angelbroking.com → angelone.in)
+# Scrip master URLs to try in order. The correct filename is
+# OpenAPIScripMaster.json (NOT ...SymbolMaster.json — that 404s).
 _SCRIP_MASTER_URLS = [
-    "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPISymbolMaster.json",
-    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPISymbolMaster.json",
+    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+    "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
 ]
 
 # Module-level cache: only stores successful non-empty results.
@@ -371,18 +392,23 @@ def _load_nifty_master_raw() -> pd.DataFrame:
     return df
 
 
-def _calc_next_thursday() -> "date":
+# NSE weekly expiry weekday for NIFTY. NSE moved NIFTY weekly expiry to
+# TUESDAY (weekday=1). Change this single constant if NSE shifts it again.
+NIFTY_EXPIRY_WEEKDAY = 1  # Monday=0, Tuesday=1, ... Sunday=6
+
+
+def _calc_next_expiry_day():
     """
-    Calculate the next NSE expiry Thursday from today.
-    Used as fallback when the scrip master is unavailable.
+    Calculate the next NSE weekly expiry day (Tuesday) from today.
+    Used as fallback when the scrip master is unavailable. Returns a date.
     """
-    from datetime import date as date_type
-    today = datetime.now(IST).date()
-    days_ahead = (3 - today.weekday()) % 7  # 3 = Thursday
+    now = datetime.now(IST)
+    today = now.date()
+    days_ahead = (NIFTY_EXPIRY_WEEKDAY - today.weekday()) % 7
     if days_ahead == 0:
-        # If today IS Thursday, check if market has already closed
-        mkt_close = datetime.now(IST).replace(hour=15, minute=30, second=0)
-        if datetime.now(IST) > mkt_close:
+        # If today IS expiry day, roll forward only after the session closes
+        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now > mkt_close:
             days_ahead = 7
     return today + timedelta(days=days_ahead)
 
@@ -421,6 +447,143 @@ def _chunked(seq, n):
         yield seq[i:i + n]
 
 
+def _parse_expiry_from_symbol(ts: str):
+    """Extract the expiry date from an NFO NIFTY option tradingsymbol.
+
+    e.g. 'NIFTY16JUN2623600CE' → date(2026, 6, 16). Returns None on failure.
+    """
+    import re
+    if not ts or not ts.startswith("NIFTY") or ts.startswith("NIFTYNXT"):
+        return None
+    m = re.match(r"^NIFTY(\d{2}[A-Z]{3}\d{2})\d+(?:CE|PE)$", ts)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%d%b%y").date()
+    except Exception:
+        return None
+
+
+def _get_expiry_from_angelone() -> list:
+    """
+    Discover NIFTY weekly expiry dates directly from AngelOne via the
+    authenticated searchScrip API (works when the public scrip master 404s).
+    Returns a sorted list of unique expiry dates, or [] on failure.
+    Result is cached at module level for 30 minutes.
+    """
+    now = time.time()
+    cache = _MASTER_CACHE.get("ao_expiries")
+    cache_ts = _MASTER_CACHE.get("ao_expiries_ts", 0)
+    if cache and (now - cache_ts) < 1800:
+        return cache
+
+    obj = get_client()
+    if obj is None:
+        return []
+    try:
+        res = obj.searchScrip("NFO", "NIFTY")
+    except Exception as e:
+        logger.warning(f"searchScrip(NIFTY) for expiry discovery failed: {e}")
+        return []
+    if not (res and res.get("status") and res.get("data")):
+        return []
+
+    dates = set()
+    for item in res["data"]:
+        ts = str(item.get("tradingsymbol", "")).upper()
+        d = _parse_expiry_from_symbol(ts)
+        if d is not None:
+            dates.add(d)
+    out = sorted(dates)
+    if out:
+        _MASTER_CACHE["ao_expiries"] = out
+        _MASTER_CACHE["ao_expiries_ts"] = now
+    return out
+
+
+def _parse_option_symbol(ts: str):
+    """
+    Parse an NFO NIFTY option tradingsymbol into (strike, option_type).
+    Accepts forms like 'NIFTY16JUN2623600CE'. Returns (None, None) if it is
+    not a plain NIFTY index option (e.g. FINNIFTY / NIFTYNXT50 / futures).
+    """
+    import re
+    if not ts or not ts.startswith("NIFTY"):
+        return None, None
+    # Exclude FINNIFTY (starts FIN), BANKNIFTY (BANK), MIDCPNIFTY, NIFTYNXT50
+    if ts.startswith("NIFTYNXT"):
+        return None, None
+    if not ts.endswith(("CE", "PE")):
+        return None, None
+    opt_type = ts[-2:]
+    # The strike is the trailing run of digits immediately before CE/PE
+    m = re.search(r"(\d+)(CE|PE)$", ts)
+    if not m:
+        return None, None
+    try:
+        strike = float(m.group(1))
+    except Exception:
+        return None, None
+    # Sanity: NIFTY strikes are 4-6 digit whole numbers (e.g. 23600)
+    if strike < 1000 or strike > 100000:
+        return None, None
+    return strike, opt_type
+
+
+def _search_nifty_options(obj, expiry_dt, spot: float, n: int = 12) -> pd.DataFrame:
+    """
+    Fallback option-contract discovery using the AUTHENTICATED searchScrip API
+    (works even when the public scrip-master file 404s). Searches by the
+    compact expiry prefix, parses the returned tradingsymbols, and keeps
+    ATM ± n strikes. Returns columns: strike, option_type, token, symbol.
+    """
+    if obj is None or expiry_dt is None:
+        return pd.DataFrame()
+
+    # Build candidate expiry prefixes AngelOne may use, e.g. 16JUN26 / 16JUN2026
+    yy = expiry_dt.strftime("%y")
+    yyyy = expiry_dt.strftime("%Y")
+    ddmon = expiry_dt.strftime("%d%b").upper()
+    prefixes = [f"NIFTY{ddmon}{yy}", f"NIFTY{ddmon}{yyyy}"]
+
+    rows = {}
+    for q in prefixes:
+        try:
+            res = obj.searchScrip("NFO", q)
+        except Exception as e:
+            logger.warning(f"searchScrip({q}) failed: {e}")
+            continue
+        if not (res and res.get("status") and res.get("data")):
+            continue
+        for item in res["data"]:
+            ts = str(item.get("tradingsymbol", "")).upper()
+            tok = str(item.get("symboltoken", ""))
+            strike, opt_type = _parse_option_symbol(ts)
+            if strike is None or not tok:
+                continue
+            rows[(strike, opt_type)] = {
+                "strike": strike, "option_type": opt_type,
+                "token": tok, "symbol": ts,
+            }
+        if rows:
+            break  # got results from this prefix; no need to try the next
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(list(rows.values()))
+    # Keep ATM ± n strikes
+    all_strikes = sorted(df["strike"].unique())
+    if spot and spot > 0 and all_strikes:
+        atm = min(all_strikes, key=lambda s: abs(s - spot))
+        atm_idx = all_strikes.index(atm)
+        lo = max(0, atm_idx - n)
+        hi = min(len(all_strikes), atm_idx + n + 1)
+        keep = set(all_strikes[lo:hi])
+        df = df[df["strike"].isin(keep)]
+    return df.reset_index(drop=True)
+
+
 @st.cache_data(ttl=10)
 def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
     """
@@ -445,16 +608,23 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
         if obj is None:
             return pd.DataFrame()
 
+        spot = fetch_ltp()
+
+        # Primary: public scrip master. Fallback: authenticated searchScrip API
+        # (the public scrip-master file currently 404s, but searchScrip works).
         master = _load_nifty_option_master(expiry_str)
         if master.empty:
-            _CHAIN_DIAG["msg"] = (
-                f"No NIFTY option contracts found for expiry {expiry_str} in the scrip master."
-            )
-            logger.error(f"No NIFTY options found in master for expiry {expiry_str}")
-            return pd.DataFrame()
+            expiry_dt = get_next_weekly_expiry()
+            master = _search_nifty_options(obj, expiry_dt, spot, n=12)
+            if master.empty:
+                _CHAIN_DIAG["msg"] = (
+                    f"No NIFTY option contracts found for {expiry_str} via scrip master "
+                    "or searchScrip API."
+                )
+                logger.error(f"No NIFTY options found for expiry {expiry_str}")
+                return pd.DataFrame()
 
         # Limit to ATM ±12 strikes to stay within the 50-token market-data cap
-        spot = fetch_ltp()
         all_strikes = sorted(master["strike"].unique())
         if spot and spot > 0:
             atm = min(all_strikes, key=lambda s: abs(s - spot))

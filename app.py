@@ -527,37 +527,31 @@ def render_recommendations_tab(patterns, spot: float):
     market_open = is_market_open()
 
     if not market_open:
-        st.info("🔴 Market closed — showing last captured session recommendations.")
+        st.warning("⚠️ Market is closed. No new recommendations. Showing historical data only.")
 
-    # Only add new recommendations when market is open (prevents stale spam).
-    # Key includes entry price so the same pattern at a materially different
-    # level adds a new entry rather than silently overwriting the old one.
+    # Add new signals to history
     if market_open and patterns:
-        existing_keys = {r.get("key") for r in st.session_state["recommendation_history"]}
         for pat in patterns:
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
-            # Round entry to nearest 10 so small float fluctuations don't churn
-            entry_bucket = int(round(float(pat.entry) / 10) * 10)
-            ts_key = f"{pat_name}_{pat.signal}_{entry_bucket}"
-            if ts_key in existing_keys:
-                continue
-            confidence = getattr(pat, "confidence", 0.5)
-            if isinstance(confidence, (int, float)):
-                conf_str = "HIGH" if confidence > 0.7 else "MEDIUM" if confidence > 0.4 else "LOW"
-            else:
-                conf_str = str(confidence)
-            st.session_state["recommendation_history"].append({
-                "key": ts_key,
-                "time": datetime.now(IST).strftime("%H:%M:%S"),
-                "pattern": pat_name,
-                "signal": pat.signal,
-                "entry": round(float(pat.entry), 2),
-                "sl": round(float(pat.stop_loss), 2),
-                "target": round(float(pat.target), 2),
-                "rr": pat.risk_reward,
-                "confidence": conf_str,
-                "description": getattr(pat, "description", ""),
-            })
+            ts_key = f"{pat_name}_{pat.signal}_{pat.entry}"
+            if ts_key not in [r.get("key") for r in st.session_state["recommendation_history"]]:
+                confidence = getattr(pat, "confidence", 0.5)
+                if isinstance(confidence, (int, float)):
+                    conf_str = "HIGH" if confidence > 0.7 else "MEDIUM" if confidence > 0.4 else "LOW"
+                else:
+                    conf_str = str(confidence)
+                st.session_state["recommendation_history"].append({
+                    "key": ts_key,
+                    "time": datetime.now(IST).strftime("%H:%M:%S"),
+                    "pattern": pat_name,
+                    "signal": pat.signal,
+                    "entry": round(float(pat.entry), 2),
+                    "sl": round(float(pat.stop_loss), 2),
+                    "target": round(float(pat.target), 2),
+                    "rr": pat.risk_reward,
+                    "confidence": conf_str,
+                    "description": getattr(pat, "description", ""),
+                })
 
     if not st.session_state["recommendation_history"]:
         st.info("No patterns detected yet. Waiting for market data...")

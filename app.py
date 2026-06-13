@@ -546,9 +546,9 @@ def render_recommendations_tab(patterns, spot: float):
                     "time": datetime.now(IST).strftime("%H:%M:%S"),
                     "pattern": pat_name,
                     "signal": pat.signal,
-                    "entry": round(float(pat.entry), 2),
-                    "sl": round(float(pat.stop_loss), 2),
-                    "target": round(float(pat.target), 2),
+                    "entry": pat.entry,
+                    "sl": pat.stop_loss,
+                    "target": pat.target,
                     "rr": pat.risk_reward,
                     "confidence": conf_str,
                     "description": getattr(pat, "description", ""),
@@ -570,9 +570,9 @@ def render_recommendations_tab(patterns, spot: float):
             &nbsp;<span class="{badge_cls}">{conf}</span>
             &nbsp;&nbsp;<span style="color:#888;font-size:12px;">{rec['time']}</span><br>
             <span style="font-size:12px;color:#aaa;">
-                Entry: <b style="color:#fff;">{float(rec['entry']):.2f}</b> &nbsp;
-                SL: <b style="color:#ff8888;">{float(rec['sl']):.2f}</b> &nbsp;
-                Target: <b style="color:#88ff88;">{float(rec['target']):.2f}</b> &nbsp;
+                Entry: <b style="color:#fff;">{rec['entry']}</b> &nbsp;
+                SL: <b style="color:#ff8888;">{rec['sl']}</b> &nbsp;
+                Target: <b style="color:#88ff88;">{rec['target']}</b> &nbsp;
                 R:R <b style="color:#ffd700;">1:{rec['rr']}</b>
             </span><br>
             <span style="font-size:11px;color:#666;">{rec.get('description','')}</span>

@@ -128,6 +128,19 @@ def filter_to_latest_day(df: pd.DataFrame) -> pd.DataFrame:
     return df[mask].reset_index(drop=True)
 
 
+def style_cells(styler, func, subset):
+    """
+    Apply a cell-wise style, compatible across pandas versions.
+    pandas >= 2.1 uses Styler.map; older versions use Styler.applymap.
+    """
+    if hasattr(styler, "map"):
+        try:
+            return styler.map(func, subset=subset)
+        except TypeError:
+            pass
+    return styler.applymap(func, subset=subset)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -624,6 +637,50 @@ def render_paper_trade_tab(patterns, spot: float):
         st.info("Waiting for pattern signals to initiate paper trades...")
         return
 
+    # ── Detailed trade cards (what trade was taken, entry/exit, outcome) ──────
+    st.markdown("#### 📑 Trade Details")
+    for trade in reversed(st.session_state["paper_trades"][-12:]):
+        status = trade["status"]
+        sig_color = "#00ff88" if trade["signal"] == "BUY" else "#ff4444"
+        if status == "PROFIT":
+            st_color, st_icon = "#00ff88", "✅ TARGET HIT"
+        elif status == "LOSS":
+            st_color, st_icon = "#ff4444", "🛑 SL HIT"
+        else:
+            st_color, st_icon = "#aaaaff", "⏳ OPEN"
+        exit_info = ""
+        if trade["exit_price"] is not None:
+            exit_info = (f"Exit: <b style='color:#fff;'>{trade['exit_price']}</b> "
+                         f"@ {trade['exit_time']} &nbsp;|&nbsp; "
+                         f"P&L: <b style='color:{st_color};'>{trade['pnl']:+.2f} "
+                         f"({trade['pnl_pct']:+.2f}%)</b>")
+        src_badge = "SIM" if trade.get("source") == "SIM" else "LIVE"
+        st.markdown(f"""
+        <div style="background:#1e2130;border-left:4px solid {st_color};
+                    padding:10px 14px;border-radius:0 6px 6px 0;margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;">
+                <span><b style="color:{sig_color};">{trade['signal']}</b>
+                    &nbsp;<b style="color:#fff;">{trade['option']}</b>
+                    &nbsp;<span style="color:#888;font-size:11px;">[{src_badge}]</span></span>
+                <span style="color:{st_color};font-weight:bold;">{st_icon}</span>
+            </div>
+            <div style="font-size:12px;color:#aaa;margin-top:4px;">
+                Pattern: <b style="color:#ddd;">{trade['pattern']}</b>
+                &nbsp;({trade.get('confidence','')}) &nbsp;|&nbsp;
+                {trade['time']} {trade['date']}
+            </div>
+            <div style="font-size:13px;color:#ccc;margin-top:6px;">
+                Entry: <b style="color:#fff;">{trade['entry']}</b> &nbsp;|&nbsp;
+                SL: <b style="color:#ff8888;">{trade['stop_loss']}</b> &nbsp;|&nbsp;
+                Target: <b style="color:#88ff88;">{trade['target']}</b> &nbsp;|&nbsp;
+                R:R <b style="color:#ffd700;">1:{trade['rr']}</b>
+            </div>
+            <div style="font-size:13px;color:#ccc;margin-top:4px;">{exit_info}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("#### 📋 All Trades Table")
+
     # Style table
     def style_status(val):
         if val == "PROFIT":
@@ -637,7 +694,8 @@ def render_paper_trade_tab(patterns, spot: float):
     display_cols = ["id", "time", "pattern", "signal", "option", "entry", "stop_loss",
                     "target", "rr", "status", "exit_price", "exit_time", "pnl", "confidence"]
     available = [c for c in display_cols if c in df.columns]
-    styled = df[available].style.applymap(style_status, subset=["status"] if "status" in available else [])
+    styled = style_cells(df[available].style, style_status,
+                         ["status"] if "status" in available else [])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     if st.button("🗑️ Clear Paper Trades", key="clear_paper"):
@@ -671,7 +729,8 @@ def render_oi_table_tab(candle_data_by_tf: dict, options_df: pd.DataFrame, spot:
             return "color: #ff4444; font-size: 18px; font-weight: bold"
         return "color: #ffd700"
 
-    styled = oi_table.style.applymap(style_trend, subset=["Trend"]).applymap(style_arrow, subset=["Arrow"])
+    styled = style_cells(oi_table.style, style_trend, ["Trend"])
+    styled = style_cells(styled, style_arrow, ["Arrow"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     delta_info = compute_delta_oi(options_df, spot)
@@ -740,7 +799,7 @@ def render_greeks_tab(options_df: pd.DataFrame, spot: float):
                 return "color: #ff4444; font-weight: bold"
             return ""
 
-        styled = trend_table.style.applymap(style_signal, subset=["Signal"])
+        styled = style_cells(trend_table.style, style_signal, ["Signal"])
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
     st.markdown("#### Gamma Exposure (GEX)")

@@ -165,61 +165,38 @@ def is_market_open() -> bool:
 
 def get_next_weekly_expiry() -> datetime:
     """
-    Get the next weekly Nifty expiry date dynamically from AngelOne API.
-    Searches NFO scrips for NIFTY options and returns the nearest upcoming expiry.
-    Falls back to session_state cached value, then to nearest weekday if API unavailable.
+    Get the next weekly NIFTY expiry from the NFO scrip master (authoritative
+    list of all listed option expiries). Picks the nearest upcoming expiry.
+    Falls back to the cached value, else returns None so the UI shows '---'.
     """
     now = datetime.now(IST)
     today = now.date()
 
-    # Try AngelOne API first
+    # Primary source: the public NFO scrip master (no auth needed, reliable)
     try:
-        obj = get_client()
-        if obj is not None:
-            response = obj.searchScrip("NFO", "NIFTY")
-            if response and response.get("status") and response.get("data"):
-                expiry_dates = set()
-                for scrip in response["data"]:
-                    # Only weekly options (not monthly futures/options with far dates)
-                    name = scrip.get("tradingsymbol", "")
-                    expiry_str = scrip.get("expiry", "")
-                    if not expiry_str or "NIFTY" not in name:
-                        continue
-                    try:
-                        exp_date = datetime.strptime(expiry_str, "%d%b%Y").date()
-                        if exp_date >= today:
-                            expiry_dates.add(exp_date)
-                    except Exception:
-                        try:
-                            exp_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-                            if exp_date >= today:
-                                expiry_dates.add(exp_date)
-                        except Exception:
-                            pass
-
-                if expiry_dates:
-                    # Pick the nearest upcoming expiry
-                    nearest = min(expiry_dates)
-                    # If nearest is today and market closed, pick the next one
-                    if nearest == today:
-                        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-                        if now > mkt_close and len(expiry_dates) > 1:
-                            nearest = sorted(expiry_dates)[1]
-                    expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
-                    # Cache for fallback use
-                    st.session_state["_last_known_expiry"] = expiry_dt
-                    return expiry_dt
+        expiries = _load_nifty_expiries()
+        future = sorted(d for d in expiries if d >= today)
+        if future:
+            nearest = future[0]
+            # If today is expiry and the session has closed, roll to the next
+            if nearest == today:
+                mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+                if now > mkt_close and len(future) > 1:
+                    nearest = future[1]
+            expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
+            st.session_state["_last_known_expiry"] = expiry_dt
+            return expiry_dt
     except Exception as e:
-        logger.debug(f"Expiry fetch from API failed: {e}")
+        logger.debug(f"Expiry fetch from scrip master failed: {e}")
 
-    # Fallback 1: use last known expiry from session_state if still valid
+    # Fallback: use last known expiry from session_state if still valid
     cached = st.session_state.get("_last_known_expiry")
     if cached is not None:
         cached_date = cached.date() if hasattr(cached, "date") else cached
         if cached_date >= today:
             return cached
 
-    # Fallback 2: no API and no cached value — return None so UI can show "---"
+    # No data available — return None so UI can show "---"
     return None
 
 
@@ -312,11 +289,11 @@ _SCRIP_MASTER_URL = (
 
 
 @st.cache_data(ttl=3600)
-def _load_nifty_option_master(expiry_str: str) -> pd.DataFrame:
+def _load_nifty_master_raw() -> pd.DataFrame:
     """
-    Download the NFO scrip master and return NIFTY index options for the
-    given expiry. Columns: strike, option_type (CE/PE), token, symbol.
-    Cached for an hour (the master changes at most daily).
+    Download the NFO scrip master once and return ALL NIFTY index options.
+    Columns: strike, option_type (CE/PE), token, symbol, expiry (str),
+    expiry_date (date). Cached for an hour. This is a public file — no auth.
     """
     import requests
 
@@ -325,17 +302,19 @@ def _load_nifty_option_master(expiry_str: str) -> pd.DataFrame:
     data = resp.json()
 
     rows = []
-    target = expiry_str.upper()
     for item in data:
         if item.get("name") != "NIFTY":
             continue
         if item.get("instrumenttype") != "OPTIDX":
             continue
-        if str(item.get("expiry", "")).upper() != target:
-            continue
         symbol = item.get("symbol", "")
         opt_type = "CE" if symbol.endswith("CE") else "PE" if symbol.endswith("PE") else None
         if opt_type is None:
+            continue
+        exp_raw = str(item.get("expiry", "")).upper()
+        try:
+            exp_date = datetime.strptime(exp_raw, "%d%b%Y").date()
+        except Exception:
             continue
         try:
             strike = float(item.get("strike", 0)) / 100.0  # master strike is in paise
@@ -346,8 +325,30 @@ def _load_nifty_option_master(expiry_str: str) -> pd.DataFrame:
             "option_type": opt_type,
             "token": str(item.get("token", "")),
             "symbol": symbol,
+            "expiry": exp_raw,
+            "expiry_date": exp_date,
         })
     return pd.DataFrame(rows)
+
+
+def _load_nifty_expiries() -> list:
+    """Return sorted unique NIFTY option expiry dates from the scrip master."""
+    raw = _load_nifty_master_raw()
+    if raw.empty:
+        return []
+    return sorted(set(raw["expiry_date"].tolist()))
+
+
+def _load_nifty_option_master(expiry_str: str) -> pd.DataFrame:
+    """
+    Return NIFTY index options for the given expiry from the cached master.
+    Columns: strike, option_type (CE/PE), token, symbol.
+    """
+    raw = _load_nifty_master_raw()
+    if raw.empty:
+        return pd.DataFrame()
+    sub = raw[raw["expiry"] == expiry_str.upper()]
+    return sub[["strike", "option_type", "token", "symbol"]].reset_index(drop=True)
 
 
 def _chunked(seq, n):

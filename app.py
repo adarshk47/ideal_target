@@ -74,6 +74,8 @@ try:
         is_connected, get_data_source, get_client, get_last_error,
         get_options_diagnostic, fetch_candle_range, expiry_weekday_for,
         get_expiry_timeline_summary, flag_expiry_days,
+        INSTRUMENT_CONFIG, fetch_ltp_for, fetch_candle_data_for,
+        get_next_expiry_for, fetch_options_chain_for,
     )
     from modules.pattern_detector import detect_all_patterns
     from modules.oi_analyzer import (
@@ -87,6 +89,7 @@ try:
         is_market_open as paper_market_open,
         add_paper_trade, update_paper_trades, get_trades_df,
         get_paper_trade_summary, should_add_new_trade, clear_all_trades,
+        add_chart_rec_trade, get_chart_rec_trades_df,
     )
     MODULES_OK = True
 except Exception as e:
@@ -105,6 +108,17 @@ if "chart_tf" not in st.session_state:
     st.session_state["chart_tf"] = 5
 if "last_signal_time" not in st.session_state:
     st.session_state["last_signal_time"] = None
+# Per-instrument recommendation history and paper-trade state
+for _inst in ("NIFTY", "SENSEX", "SBIN"):
+    if f"recommendation_history_{_inst}" not in st.session_state:
+        st.session_state[f"recommendation_history_{_inst}"] = []
+    if f"paper_trades_{_inst}" not in st.session_state:
+        st.session_state[f"paper_trades_{_inst}"] = []
+    if f"paper_trade_counter_{_inst}" not in st.session_state:
+        st.session_state[f"paper_trade_counter_{_inst}"] = 0
+    if f"chart_rec_trades_{_inst}" not in st.session_state:
+        st.session_state[f"chart_rec_trades_{_inst}"] = []
+# Keep legacy key for backward compat with any existing session
 if "recommendation_history" not in st.session_state:
     st.session_state["recommendation_history"] = []
 
@@ -524,25 +538,25 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_recommendations_tab(patterns, spot: float):
+def render_recommendations_tab(patterns, spot: float, instrument: str = "NIFTY"):
     st.markdown("### 📋 Pattern Recommendations – Today's History")
     market_open = is_market_open()
+    hist_key = f"recommendation_history_{instrument}"
 
     if not market_open:
         st.warning("⚠️ Market is closed. No new recommendations. Showing historical data only.")
 
-    # Add new signals to history
     if market_open and patterns:
         for pat in patterns:
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
             ts_key = f"{pat_name}_{pat.signal}_{pat.entry}"
-            if ts_key not in [r.get("key") for r in st.session_state["recommendation_history"]]:
+            if ts_key not in [r.get("key") for r in st.session_state[hist_key]]:
                 confidence = getattr(pat, "confidence", 0.5)
                 if isinstance(confidence, (int, float)):
                     conf_str = "HIGH" if confidence > 0.7 else "MEDIUM" if confidence > 0.4 else "LOW"
                 else:
                     conf_str = str(confidence)
-                st.session_state["recommendation_history"].append({
+                st.session_state[hist_key].append({
                     "key": ts_key,
                     "time": datetime.now(IST).strftime("%H:%M:%S"),
                     "pattern": pat_name,
@@ -555,11 +569,11 @@ def render_recommendations_tab(patterns, spot: float):
                     "description": getattr(pat, "description", ""),
                 })
 
-    if not st.session_state["recommendation_history"]:
+    if not st.session_state[hist_key]:
         st.info("No patterns detected yet. Waiting for market data...")
         return
 
-    for rec in reversed(st.session_state["recommendation_history"][-20:]):
+    for rec in reversed(st.session_state[hist_key][-20:]):
         sig_color = "#00ff88" if rec["signal"] == "BUY" else "#ff4444"
         conf = rec.get("confidence", "MEDIUM")
         badge_cls = "badge-high" if conf == "HIGH" else "badge-med" if conf == "MEDIUM" else "badge-low"
@@ -580,8 +594,8 @@ def render_recommendations_tab(patterns, spot: float):
         </div>
         """, unsafe_allow_html=True)
 
-    if st.button("🗑️ Clear History", key="clear_rec_history"):
-        st.session_state["recommendation_history"] = []
+    if st.button("🗑️ Clear History", key=f"clear_rec_history_{instrument}"):
+        st.session_state[hist_key] = []
         st.rerun()
 
 
@@ -624,7 +638,8 @@ def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_
         st.info("Loading strike data...")
 
 
-def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=None):
+def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=None,
+                           instrument: str = "NIFTY"):
     st.markdown("### 📝 Paper Trading – Auto Signals")
     market_open = is_market_open()
     effective_spot = spot if spot and spot > 0 else st.session_state.get("_last_ltp", 22000.0)
@@ -636,19 +651,23 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
     # Auto-add trades from patterns.
     # Live mode: OPEN trades tracked in real-time via update_paper_trades().
     # Closed mode: resolve immediately using candle-scan exit + option premium entry.
+    # Strike gap per instrument
+    cfg = INSTRUMENT_CONFIG.get(instrument, INSTRUMENT_CONFIG["NIFTY"])
+    strike_gap = cfg.get("strike_gap", 50)
+
     # ATM IV from the current options snapshot (used as a flat vol for B-S pricing).
-    cur_atm = float(round(effective_spot / 50) * 50)
+    cur_atm = float(round(effective_spot / strike_gap) * strike_gap)
     _atm_ce_iv, _atm_pe_iv = 0.15, 0.15
     if options_df is not None and not options_df.empty:
         try:
-            atm_row = options_df[(options_df["strike"] - cur_atm).abs() < 26]
+            atm_row = options_df[(options_df["strike"] - cur_atm).abs() < strike_gap * 0.6]
             if not atm_row.empty:
                 _atm_ce_iv = max(float(atm_row.iloc[0].get("ce_iv", 15) or 15) / 100, 0.05)
                 _atm_pe_iv = max(float(atm_row.iloc[0].get("pe_iv", 15) or 15) / 100, 0.05)
         except Exception:
             pass
 
-    expiry_dt_for_bs = get_next_weekly_expiry()
+    expiry_dt_for_bs = get_next_expiry_for(instrument)
 
     def _bs_option_price(spot_val, strike, opt_type, candle_ts):
         """B-S option price for a given strike at a given spot & candle time."""
@@ -669,7 +688,7 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
         for pat in patterns:
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
             sim = not market_open
-            if should_add_new_trade(pat_name, pat.signal, simulated=sim):
+            if should_add_new_trade(pat_name, pat.signal, simulated=sim, instrument=instrument):
                 opt_type = "C" if pat.signal == "BUY" else "P"
                 entry_idx = getattr(pat, "index", getattr(pat, "bar_index", -1))
 
@@ -677,26 +696,22 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
                 option_sl = None
                 option_target = None
                 entry_time = None
-                trade_spot = effective_spot      # drives ATM strike & option name
+                trade_spot = effective_spot
                 trade_strike = cur_atm
 
                 if sim and candle_df is not None and not candle_df.empty and 0 <= entry_idx < len(candle_df):
-                    # ── Strike = ATM at the pattern candle's spot (not today's) ──
                     try:
                         entry_ts = candle_df["timestamp"].iloc[entry_idx]
                         entry_time = pd.Timestamp(entry_ts).strftime("%H:%M:%S")
                         spot_at_entry = float(candle_df["close"].iloc[entry_idx])
                         trade_spot = spot_at_entry
-                        trade_strike = float(round(spot_at_entry / 50) * 50)
-                        # Entry/SL/target option premiums, all on the entry-time
-                        # ATM strike, priced at the spot level for each leg.
+                        trade_strike = float(round(spot_at_entry / strike_gap) * strike_gap)
                         option_ltp = _bs_option_price(spot_at_entry, trade_strike, opt_type, entry_ts)
                         option_sl = _bs_option_price(float(pat.stop_loss), trade_strike, opt_type, entry_ts)
                         option_target = _bs_option_price(float(pat.target), trade_strike, opt_type, entry_ts)
                     except Exception:
                         pass
                 elif not sim and options_df is not None and not options_df.empty:
-                    # Live: use current ATM LTP snapshot
                     opt_col = "ce_ltp" if pat.signal == "BUY" else "pe_ltp"
                     try:
                         closest_idx = (options_df["strike"] - cur_atm).abs().argsort().iloc[0]
@@ -705,13 +720,15 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
                     except Exception:
                         pass
 
-                # ── For simulation: scan candles for exit, then B-S exit price ─
+                # Scan candles for exit
                 exit_info = None
+                chart_exit_ts, chart_exit_status = None, "OPEN"
                 if sim and candle_df is not None and not candle_df.empty:
                     exit_ts, exit_status, exit_idx = _scan_exit(
                         candle_df, entry_idx, pat.signal,
                         float(pat.stop_loss), float(pat.target),
                     )
+                    chart_exit_ts, chart_exit_status = exit_ts, exit_status
                     if exit_status in ("PROFIT", "LOSS"):
                         exit_option_price = None
                         if exit_idx >= 0 and option_ltp > 0:
@@ -727,19 +744,30 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
                             "exit_time": exit_ts,
                             "exit_option_price": exit_option_price,
                         }
-                    # "OPEN" → exit_info stays None → falls through to R:R sim
 
                 add_paper_trade(pat, pat_name, trade_spot,
                                 source="AUTO", simulated=sim,
                                 option_ltp=option_ltp, exit_info=exit_info,
                                 entry_time=entry_time, strike=trade_strike,
-                                option_sl=option_sl, option_target=option_target)
+                                option_sl=option_sl, option_target=option_target,
+                                instrument=instrument)
+
+                # Chart rec trade (spot-level, separate table)
+                add_chart_rec_trade(
+                    pattern_name=pat_name, signal=pat.signal,
+                    entry=float(pat.entry), sl=float(pat.stop_loss),
+                    target=float(pat.target), rr=pat.risk_reward,
+                    entry_time=entry_time or "",
+                    exit_time=chart_exit_ts or "",
+                    status=chart_exit_status,
+                    instrument=instrument,
+                )
 
     # Update open trade statuses
-    update_paper_trades(spot)
+    update_paper_trades(spot, instrument=instrument)
 
     # Summary
-    summary = get_paper_trade_summary()
+    summary = get_paper_trade_summary(instrument=instrument)
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.metric("Total Trades", summary["total"])
@@ -750,86 +778,106 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
     with c4:
         st.metric("Losses", summary["loss"])
     with c5:
-        pnl_color = "normal" if summary["total_pnl"] >= 0 else "inverse"
         st.metric("Total P&L", f"₹{summary['total_pnl']:+.0f}", delta=f"{summary['win_rate']:.0f}% win")
 
-    df = get_trades_df()
+    df = get_trades_df(instrument=instrument)
     if df.empty:
         st.info("Waiting for pattern signals to initiate paper trades...")
-        return
-
-    # ── Detailed trade cards (what trade was taken, entry/exit, outcome) ──────
-    st.markdown("#### 📑 Trade Details")
-    for trade in reversed(st.session_state["paper_trades"][-12:]):
-        status = trade["status"]
-        sig_color = "#00ff88" if trade["signal"] == "BUY" else "#ff4444"
-        if status == "PROFIT":
-            st_color, st_icon = "#00ff88", "✅ TARGET HIT"
-        elif status == "LOSS":
-            st_color, st_icon = "#ff4444", "🛑 SL HIT"
-        else:
-            st_color, st_icon = "#aaaaff", "⏳ OPEN"
-        exit_card = ""
-        if trade["exit_price"] is not None:
-            exit_card = (f"Exit: <b style='color:#fff;'>{float(trade['exit_price']):.2f}</b> "
-                         f"@ {trade['exit_time'] or '—'} &nbsp;|&nbsp; "
-                         f"P&L: <b style='color:{st_color};'>{trade['pnl']:+.2f} "
-                         f"({trade['pnl_pct']:+.2f}%)</b>")
-        src_badge = "SIM" if trade.get("source") == "SIM" else "LIVE"
-        entry_note = " <span style='color:#888;font-size:10px;'>(premium)</span>" \
-            if trade.get("source") == "SIM" and trade.get("entry_spot", 0) != trade.get("entry", 0) else ""
-        st.markdown(f"""
-        <div style="background:#1e2130;border-left:4px solid {st_color};
-                    padding:10px 14px;border-radius:0 6px 6px 0;margin-bottom:8px;">
-            <div style="display:flex;justify-content:space-between;">
-                <span><b style="color:{sig_color};">{trade['signal']}</b>
-                    &nbsp;<b style="color:#fff;">{trade['option']}</b>
-                    &nbsp;<span style="color:#888;font-size:11px;">[{src_badge}]</span></span>
-                <span style="color:{st_color};font-weight:bold;">{st_icon}</span>
+    else:
+        # ── Trade detail cards ────────────────────────────────────────────────
+        st.markdown("#### 📑 Trade Details")
+        for trade in reversed(st.session_state[f"paper_trades_{instrument}"][-12:]):
+            status = trade["status"]
+            sig_color = "#00ff88" if trade["signal"] == "BUY" else "#ff4444"
+            if status == "PROFIT":
+                st_color, st_icon = "#00ff88", "✅ TARGET HIT"
+            elif status == "LOSS":
+                st_color, st_icon = "#ff4444", "🛑 SL HIT"
+            else:
+                st_color, st_icon = "#aaaaff", "⏳ OPEN"
+            exit_card = ""
+            if trade["exit_price"] is not None:
+                exit_card = (f"Exit: <b style='color:#fff;'>{float(trade['exit_price']):.2f}</b> "
+                             f"@ {trade['exit_time'] or '—'} &nbsp;|&nbsp; "
+                             f"P&L: <b style='color:{st_color};'>{trade['pnl']:+.2f} "
+                             f"({trade['pnl_pct']:+.2f}%)</b>")
+            src_badge = "SIM" if trade.get("source") == "SIM" else "LIVE"
+            entry_note = " <span style='color:#888;font-size:10px;'>(premium)</span>" \
+                if trade.get("source") == "SIM" and trade.get("entry_spot", 0) != trade.get("entry", 0) else ""
+            st.markdown(f"""
+            <div style="background:#1e2130;border-left:4px solid {st_color};
+                        padding:10px 14px;border-radius:0 6px 6px 0;margin-bottom:8px;">
+                <div style="display:flex;justify-content:space-between;">
+                    <span><b style="color:{sig_color};">{trade['signal']}</b>
+                        &nbsp;<b style="color:#fff;">{trade['option']}</b>
+                        &nbsp;<span style="color:#888;font-size:11px;">[{src_badge}]</span></span>
+                    <span style="color:{st_color};font-weight:bold;">{st_icon}</span>
+                </div>
+                <div style="font-size:12px;color:#aaa;margin-top:4px;">
+                    Pattern: <b style="color:#ddd;">{trade['pattern']}</b>
+                    &nbsp;({trade.get('confidence','')}) &nbsp;|&nbsp;
+                    {trade['time']} {trade['date']}
+                    &nbsp;|&nbsp; Spot: {float(trade.get('entry_spot', 0)):.2f}
+                </div>
+                <div style="font-size:13px;color:#ccc;margin-top:6px;">
+                    Entry:{entry_note} <b style="color:#fff;">{float(trade['entry']):.2f}</b> &nbsp;|&nbsp;
+                    SL: <b style="color:#ff8888;">{float(trade['stop_loss']):.2f}</b> &nbsp;|&nbsp;
+                    Target: <b style="color:#88ff88;">{float(trade['target']):.2f}</b> &nbsp;|&nbsp;
+                    R:R <b style="color:#ffd700;">1:{trade['rr']}</b>
+                </div>
+                <div style="font-size:13px;color:#ccc;margin-top:4px;">{exit_card}</div>
             </div>
-            <div style="font-size:12px;color:#aaa;margin-top:4px;">
-                Pattern: <b style="color:#ddd;">{trade['pattern']}</b>
-                &nbsp;({trade.get('confidence','')}) &nbsp;|&nbsp;
-                {trade['time']} {trade['date']}
-                &nbsp;|&nbsp; Spot: {float(trade.get('entry_spot', 0)):.2f}
-            </div>
-            <div style="font-size:13px;color:#ccc;margin-top:6px;">
-                Entry:{entry_note} <b style="color:#fff;">{float(trade['entry']):.2f}</b> &nbsp;|&nbsp;
-                SL: <b style="color:#ff8888;">{float(trade['stop_loss']):.2f}</b> &nbsp;|&nbsp;
-                Target: <b style="color:#88ff88;">{float(trade['target']):.2f}</b> &nbsp;|&nbsp;
-                R:R <b style="color:#ffd700;">1:{trade['rr']}</b>
-            </div>
-            <div style="font-size:13px;color:#ccc;margin-top:4px;">{exit_card}</div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
-    st.markdown("#### 📋 All Trades Table")
+        st.markdown("#### 📋 All Trades Table")
 
-    # Style table
-    def style_status(val):
-        if val == "PROFIT":
-            return "background-color: #1a3a1a; color: #00ff88"
-        elif val == "LOSS":
-            return "background-color: #3a1a1a; color: #ff4444"
-        elif val == "OPEN":
-            return "background-color: #1a1a3a; color: #aaaaff"
-        return ""
+        def style_status(val):
+            if val == "PROFIT":
+                return "background-color: #1a3a1a; color: #00ff88"
+            elif val == "LOSS":
+                return "background-color: #3a1a1a; color: #ff4444"
+            elif val == "OPEN":
+                return "background-color: #1a1a3a; color: #aaaaff"
+            return ""
 
-    display_cols = ["id", "time", "pattern", "signal", "option", "entry", "stop_loss",
-                    "target", "rr", "status", "exit_price", "exit_time", "pnl", "pnl_pct",
-                    "confidence"]
-    available = [c for c in display_cols if c in df.columns]
-    styled = style_cells(df[available].style, style_status,
-                         ["status"] if "status" in available else [])
-    # Force exactly 2 decimals on all price/number columns
-    num_fmt = {c: "{:.2f}" for c in ["entry", "stop_loss", "target", "exit_price",
-                                     "pnl", "pnl_pct", "rr"] if c in available}
-    if num_fmt:
-        styled = styled.format(num_fmt, na_rep="—")
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+        display_cols = ["id", "time", "pattern", "signal", "option", "entry", "stop_loss",
+                        "target", "rr", "status", "exit_price", "exit_time", "pnl", "pnl_pct",
+                        "confidence"]
+        available = [c for c in display_cols if c in df.columns]
+        styled = style_cells(df[available].style, style_status,
+                             ["status"] if "status" in available else [])
+        num_fmt = {c: "{:.2f}" for c in ["entry", "stop_loss", "target", "exit_price",
+                                         "pnl", "pnl_pct", "rr"] if c in available}
+        if num_fmt:
+            styled = styled.format(num_fmt, na_rep="—")
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    if st.button("🗑️ Clear Paper Trades", key="clear_paper"):
-        clear_all_trades()
+    # ── Chart Recommendation Trades (spot-level) ──────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📋 Chart Recommendation Trades (Spot Level)")
+    st.caption("Spot-price signal with entry/exit as found by candle scan — "
+               "no option premium, pure price-action.")
+    rec_df = get_chart_rec_trades_df(instrument=instrument)
+    if rec_df.empty:
+        st.info("No chart recommendation trades recorded yet.")
+    else:
+        def style_rec_status(val):
+            if val == "PROFIT":
+                return "background-color: #1a3a1a; color: #00ff88"
+            elif val == "LOSS":
+                return "background-color: #3a1a1a; color: #ff4444"
+            return "color: #aaaaff"
+
+        rec_styled = style_cells(rec_df.style, style_rec_status,
+                                 ["status"] if "status" in rec_df.columns else [])
+        num_cols = ["entry", "stop_loss", "target"]
+        rec_fmt = {c: "{:.2f}" for c in num_cols if c in rec_df.columns}
+        if rec_fmt:
+            rec_styled = rec_styled.format(rec_fmt)
+        st.dataframe(rec_styled, use_container_width=True, hide_index=True)
+
+    if st.button("🗑️ Clear Paper Trades", key=f"clear_paper_{instrument}"):
+        clear_all_trades(instrument=instrument)
         st.rerun()
 
 
@@ -1597,11 +1645,109 @@ def render_connect_panel(connected: bool):
     st.markdown("<hr style='border-color:#2d3250;margin:6px 0;'>", unsafe_allow_html=True)
 
 
+def _render_instrument_section(instrument: str, selected_tf: int):
+    """Fetch data and render all 7 sub-tabs for one instrument."""
+    cfg = INSTRUMENT_CONFIG.get(instrument, INSTRUMENT_CONFIG["NIFTY"])
+
+    # Fetch LTP / spot
+    spot = fetch_ltp_for(instrument)
+    if spot and spot > 0:
+        st.session_state[f"_last_ltp_{instrument}"] = spot
+    else:
+        spot = st.session_state.get(f"_last_ltp_{instrument}", 0.0)
+
+    # Candles
+    candle_df_wide = fetch_candle_data_for(instrument, selected_tf, 200)
+    candle_df = filter_to_latest_day(candle_df_wide)
+
+    # Multi-timeframe candles (OI table)
+    candle_data_by_tf = {tf: fetch_candle_data_for(instrument, tf, 80)
+                         for tf in [1, 2, 5, 10, 15, 30, 60]}
+
+    # Options chain
+    expiry_dt = get_next_expiry_for(instrument)
+    expiry_str = get_expiry_string(expiry_dt)
+    options_df = fetch_options_chain_for(instrument, expiry_str)
+    if options_df is None or options_df.empty:
+        cached = st.session_state.get(f"_last_options_df_{instrument}")
+        if cached is not None and not cached.empty:
+            options_df = cached
+    if options_df is not None and not options_df.empty:
+        st.session_state[f"_last_options_df_{instrument}"] = options_df
+
+    # Pattern detection
+    patterns = []
+    if candle_df is not None and not candle_df.empty:
+        try:
+            patterns = detect_all_patterns(candle_df)
+        except Exception as e:
+            st.warning(f"Pattern detection ({instrument}): {e}")
+
+    # OI / Greeks analysis
+    oi_delta, oi_annotations, greeks_result = {}, [], {}
+    if options_df is not None and not options_df.empty:
+        try:
+            oi_delta = compute_delta_oi(options_df, spot)
+            oi_annotations = get_oi_arrow_annotations(candle_df, options_df, spot, selected_tf)
+        except Exception:
+            pass
+        try:
+            greeks_result = analyze_greeks(options_df, spot)
+        except Exception:
+            pass
+
+    # Expiry countdown banner
+    countdown = get_expiry_countdown(expiry_dt)
+    st.markdown(
+        f"<div style='background:#1e2130;border-radius:6px;padding:6px 14px;"
+        f"font-size:13px;color:#aaa;margin-bottom:8px;'>"
+        f"<b style='color:#fff;'>{cfg['display_name']}</b> &nbsp;|&nbsp; "
+        f"Spot: <b style='color:#00ff88;'>{spot:,.2f}</b> &nbsp;|&nbsp; "
+        f"Expiry: <b style='color:#ffd700;'>{expiry_str}</b> &nbsp;|&nbsp; "
+        f"<span style='color:#aaa;'>{countdown}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    # Chart
+    fig = build_chart(candle_df, patterns, oi_annotations, selected_tf)
+    st.plotly_chart(fig, use_container_width=True, config={
+        "displayModeBar": True,
+        "displaylogo": False,
+        "modeBarButtonsToRemove": ["pan2d", "lasso2d"],
+    })
+
+    # Sub-tabs
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+        "📋 Recommendations",
+        "🎯 Strike Volume",
+        "📝 Paper Trade",
+        "📊 OI Table",
+        "🔢 Greeks",
+        "🏆 Best Trade",
+        "📅 Expiry Analysis",
+    ])
+    with t1:
+        render_recommendations_tab(patterns, spot, instrument=instrument)
+    with t2:
+        render_strike_volume_tab(options_df, spot, candle_data_by_tf)
+    with t3:
+        render_paper_trade_tab(patterns, spot, options_df=options_df,
+                               candle_df=candle_df, instrument=instrument)
+    with t4:
+        render_oi_table_tab(candle_data_by_tf, options_df, spot)
+    with t5:
+        render_greeks_tab(options_df, spot)
+    with t6:
+        render_best_trade_tab(patterns, options_df, spot, oi_delta, greeks_result)
+    with t7:
+        render_expiry_analysis_tab(candle_df_wide, spot, expiry_dt)
+
+
 def main():
     if not MODULES_OK:
         st.stop()
 
-    # Fetch core data
+    # Fetch NIFTY LTP for header display
     ltp = fetch_ltp()
     if ltp and ltp > 0:
         st.session_state["_last_ltp"] = ltp
@@ -1625,104 +1771,32 @@ def main():
                     st.cache_data.clear()
                     st.rerun()
 
-    # Timeframe selector for chart
+    # Timeframe selector (shared across instruments)
     tf_options = {1: "1 min", 2: "2 min", 5: "5 min", 10: "10 min",
                   15: "15 min", 30: "30 min", 60: "60 min"}
-    tf_col1, tf_col2 = st.columns([3, 9])
+    tf_col1, _ = st.columns([3, 9])
     with tf_col1:
         selected_tf = st.radio(
             "Chart Timeframe",
             options=list(tf_options.keys()),
             format_func=lambda x: tf_options[x],
-            index=2,  # default 5min
+            index=2,
             horizontal=True,
             key="chart_tf_radio",
         )
 
-    # Fetch candle data for selected TF; keep both the full window and last-day view
-    candle_df_wide = fetch_candle_data(selected_tf, 200)   # 6-day window, for pre-week calc
-    candle_df = filter_to_latest_day(candle_df_wide)       # today/last-day only, for chart
-
-    # Fetch data for all timeframes (for OI table)
-    candle_data_by_tf = {}
-    for tf in [1, 2, 5, 10, 15, 30, 60]:
-        candle_data_by_tf[tf] = fetch_candle_data(tf, 80)
-
-    # Fetch options chain; fall back to last cached result if unavailable
-    expiry_dt = get_next_weekly_expiry()
-    expiry_str = get_expiry_string(expiry_dt)
-    options_df = fetch_options_chain(expiry_str)
-    if options_df is None or options_df.empty:
-        cached_opts = st.session_state.get("_last_options_df")
-        if cached_opts is not None and not cached_opts.empty:
-            options_df = cached_opts
-
-    # Detect patterns
-    patterns = []
-    if candle_df is not None and not candle_df.empty:
-        try:
-            patterns = detect_all_patterns(candle_df)
-        except Exception as e:
-            st.warning(f"Pattern detection error: {e}")
-
-    # OI analysis
-    oi_delta = {}
-    oi_annotations = []
-    if options_df is not None and not options_df.empty:
-        try:
-            oi_delta = compute_delta_oi(options_df, ltp)
-            oi_annotations = get_oi_arrow_annotations(candle_df, options_df, ltp, selected_tf)
-        except Exception:
-            pass
-
-    # Greeks analysis
-    greeks_result = {}
-    if options_df is not None and not options_df.empty:
-        try:
-            greeks_result = analyze_greeks(options_df, ltp)
-        except Exception:
-            pass
-
-    # Build and render chart
-    with st.spinner(""):
-        fig = build_chart(candle_df, patterns, oi_annotations, selected_tf)
-        st.plotly_chart(fig, use_container_width=True, config={
-            "displayModeBar": True,
-            "displaylogo": False,
-            "modeBarButtonsToRemove": ["pan2d", "lasso2d"],
-        })
-
-    # ── Tabs ─────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📋 Recommendations",
-        "🎯 Strike Volume",
-        "📝 Paper Trade",
-        "📊 OI Table",
-        "🔢 Greeks",
-        "🏆 Best Trade",
-        "📅 Expiry Analysis",
+    # ── Instrument tabs ───────────────────────────────────────────────────────
+    inst_tab_nifty, inst_tab_sensex, inst_tab_sbin = st.tabs([
+        "📈 Nifty 50", "📊 Sensex", "🏦 SBIN"
     ])
 
-    with tab1:
-        render_recommendations_tab(patterns, ltp)
-
-    with tab2:
-        render_strike_volume_tab(options_df, ltp, candle_data_by_tf)
-
-    with tab3:
-        render_paper_trade_tab(patterns, ltp, options_df=options_df, candle_df=candle_df)
-
-    with tab4:
-        render_oi_table_tab(candle_data_by_tf, options_df, ltp)
-
-    with tab5:
-        render_greeks_tab(options_df, ltp)
-
-    with tab6:
-        render_best_trade_tab(patterns, options_df, ltp, oi_delta, greeks_result)
-
-    with tab7:
-        render_expiry_analysis_tab(candle_df_wide, ltp, expiry_dt)
+    for _inst_tab, _inst_key in [
+        (inst_tab_nifty, "NIFTY"),
+        (inst_tab_sensex, "SENSEX"),
+        (inst_tab_sbin, "SBIN"),
+    ]:
+        with _inst_tab:
+            _render_instrument_section(_inst_key, selected_tf)
 
     # ── Auto-refresh bar at bottom ─────────────────────────────────────────
     st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)

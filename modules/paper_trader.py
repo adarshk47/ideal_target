@@ -1,7 +1,8 @@
 """
-Paper Trading Module for Nifty50.
+Paper Trading Module for Nifty50, Sensex, SBIN.
 Auto-generates and tracks paper trades based on pattern signals.
 Works both during live market AND in post-market simulation mode.
+All state is keyed per-instrument so NIFTY/SENSEX/SBIN trades never mix.
 """
 
 import streamlit as st
@@ -22,57 +23,52 @@ def is_market_open() -> bool:
     return market_open <= now <= market_close
 
 
-def init_paper_trades():
-    if "paper_trades" not in st.session_state:
-        st.session_state["paper_trades"] = []
-    if "paper_trade_counter" not in st.session_state:
-        st.session_state["paper_trade_counter"] = 0
+def init_paper_trades(instrument: str = "NIFTY"):
+    k = instrument
+    if f"paper_trades_{k}" not in st.session_state:
+        st.session_state[f"paper_trades_{k}"] = []
+    if f"paper_trade_counter_{k}" not in st.session_state:
+        st.session_state[f"paper_trade_counter_{k}"] = 0
+    if f"chart_rec_trades_{k}" not in st.session_state:
+        st.session_state[f"chart_rec_trades_{k}"] = []
 
 
 def add_paper_trade(signal, pattern_name: str, spot_price: float,
                     source: str = "AUTO", simulated: bool = False,
                     option_ltp: float = 0.0, exit_info: dict = None,
                     entry_time: str = None, strike: float = None,
-                    option_sl: float = None, option_target: float = None):
+                    option_sl: float = None, option_target: float = None,
+                    instrument: str = "NIFTY"):
     """Add a new paper trade from a pattern signal.
 
     option_ltp: if > 1, use as option premium entry price.
     option_sl / option_target: option premiums at the spot stop-loss / target
-                levels (B-S priced on the entry-time ATM strike). When given,
-                they replace the fabricated 25%-risk model so the option
-                SL/target reflect the actual price action.
-    exit_info:  {'status': 'PROFIT'|'LOSS', 'exit_time': 'HH:MM:SS'|None,
-                 'exit_option_price': float|None} from candle-scan.
-    entry_time: 'HH:MM:SS' of the pattern candle. In simulation the entry must
-                be timed to the candle that triggered the signal — not the
-                current wall-clock time — otherwise entry/exit times are
-                inconsistent (entry would appear after the exit).
-    strike:     explicit ATM strike for the option name; defaults to the strike
-                nearest spot_price.
+                levels (B-S priced on the entry-time ATM strike).
+    exit_info:  {'status': 'PROFIT'|'LOSS', 'exit_time': str|None,
+                 'exit_option_price': float|None}
+    entry_time: 'HH:MM:SS' of the pattern candle.
+    strike:     explicit ATM strike for the option name.
+    instrument: 'NIFTY', 'SENSEX', or 'SBIN'.
     """
-    init_paper_trades()
+    init_paper_trades(instrument)
     now = datetime.now(IST)
-    st.session_state["paper_trade_counter"] += 1
-    trade_id = st.session_state["paper_trade_counter"]
+    st.session_state[f"paper_trade_counter_{instrument}"] += 1
+    trade_id = st.session_state[f"paper_trade_counter_{instrument}"]
 
-    # Entry timestamp: the pattern candle time when provided (simulation),
-    # otherwise the live wall-clock time.
     trade_time = entry_time if entry_time else now.strftime("%H:%M:%S")
 
     atm = int(strike) if strike else round(spot_price / 50) * 50
     option_type = "CE" if signal.signal == "BUY" else "PE"
     rr = float(signal.risk_reward or 1.5)
 
-    # Determine entry basis: option premium OR spot-level signal values
     use_option = bool(option_ltp and option_ltp > 1.0)
     if use_option:
         entry = round(float(option_ltp), 2)
         if option_sl is not None and option_target is not None:
-            # Option premiums at the spot SL / target — tied to real levels
             sl = round(float(option_sl), 2)
             target = round(float(option_target), 2)
         else:
-            risk = round(entry * 0.25, 2)      # 25% of premium as risk fallback
+            risk = round(entry * 0.25, 2)
             sl = round(entry - risk, 2)
             target = round(entry + risk * rr, 2)
         risk = abs(entry - sl)
@@ -89,11 +85,9 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
     pnl_pct = 0.0
 
     if simulated:
-        # Priority 1: candle-scan provided a resolved outcome
         if exit_info and exit_info.get("status") in ("PROFIT", "LOSS"):
             status = exit_info["status"]
             exit_time = exit_info.get("exit_time")
-            # Use B-S-computed option exit price when available (most accurate)
             exit_opt = exit_info.get("exit_option_price")
             if exit_opt is not None and use_option and exit_opt > 0:
                 exit_price = exit_opt
@@ -107,9 +101,8 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
             pnl_pct = round(pnl / entry * 100, 2) if entry else 0.0
 
         else:
-            # Priority 2: R:R-based simulation fallback
+            # R:R simulation fallback
             if use_option:
-                # Options are always bought (CE for BUY, PE for SELL) → premium goes up when right
                 sim_exit = entry + risk * (rr * 0.5)
                 if sim_exit >= target:
                     status, exit_price = "PROFIT", target
@@ -132,7 +125,7 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
                         status = "PROFIT" if rr >= 1.5 else "LOSS"
                         exit_price = round(sim_exit, 2)
                         pnl = round(sim_exit - entry, 2)
-                else:  # SELL (spot-level)
+                else:
                     sim_exit = entry - risk * (rr * 0.5)
                     if sim_exit <= target:
                         status, exit_price = "PROFIT", target
@@ -146,8 +139,6 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
                         pnl = round(entry - sim_exit, 2)
 
             pnl_pct = round(pnl / entry * 100, 2) if entry else 0.0
-            # No candle-confirmed exit; leave exit_time blank rather than
-            # stamping the (post-market) wall-clock time.
             exit_time = None
 
     trade = {
@@ -156,7 +147,7 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
         "date": now.strftime("%d-%b-%Y"),
         "pattern": pattern_name,
         "signal": signal.signal,
-        "option": f"NIFTY {int(atm)} {option_type}",
+        "option": f"{instrument} {int(atm)} {option_type}",
         "entry_spot": round(spot_price, 2),
         "entry": entry,
         "stop_loss": sl,
@@ -170,15 +161,15 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
         "source": "SIM" if simulated else source,
         "confidence": getattr(signal, "confidence", "MEDIUM"),
     }
-    st.session_state["paper_trades"].append(trade)
+    st.session_state[f"paper_trades_{instrument}"].append(trade)
     return trade_id
 
 
-def update_paper_trades(current_spot: float):
+def update_paper_trades(current_spot: float, instrument: str = "NIFTY"):
     """Check open trades and mark them complete if SL or target is hit."""
-    init_paper_trades()
+    init_paper_trades(instrument)
     now = datetime.now(IST)
-    for trade in st.session_state["paper_trades"]:
+    for trade in st.session_state[f"paper_trades_{instrument}"]:
         if trade["status"] != "OPEN":
             continue
         entry = trade["entry"]
@@ -208,15 +199,15 @@ def update_paper_trades(current_spot: float):
                              pnl_pct=round((entry - target) / entry * 100, 2))
 
 
-def get_trades_df() -> pd.DataFrame:
-    init_paper_trades()
-    if not st.session_state["paper_trades"]:
+def get_trades_df(instrument: str = "NIFTY") -> pd.DataFrame:
+    init_paper_trades(instrument)
+    if not st.session_state[f"paper_trades_{instrument}"]:
         return pd.DataFrame()
-    return pd.DataFrame(st.session_state["paper_trades"])
+    return pd.DataFrame(st.session_state[f"paper_trades_{instrument}"])
 
 
-def get_paper_trade_summary() -> Dict:
-    df = get_trades_df()
+def get_paper_trade_summary(instrument: str = "NIFTY") -> Dict:
+    df = get_trades_df(instrument)
     if df.empty:
         return {"total": 0, "open": 0, "profit": 0, "loss": 0,
                 "total_pnl": 0.0, "win_rate": 0.0}
@@ -235,12 +226,13 @@ def get_paper_trade_summary() -> Dict:
 
 
 def should_add_new_trade(pattern_name: str, signal_type: str,
-                         simulated: bool = False) -> bool:
+                         simulated: bool = False,
+                         instrument: str = "NIFTY") -> bool:
     """Avoid duplicate trades for same pattern."""
-    init_paper_trades()
+    init_paper_trades(instrument)
     source = "SIM" if simulated else "AUTO"
     recent = [
-        t for t in st.session_state["paper_trades"]
+        t for t in st.session_state[f"paper_trades_{instrument}"]
         if t["pattern"] == pattern_name
         and t["signal"] == signal_type
         and t["source"] == source
@@ -248,6 +240,45 @@ def should_add_new_trade(pattern_name: str, signal_type: str,
     return len(recent) == 0
 
 
-def clear_all_trades():
-    st.session_state["paper_trades"] = []
-    st.session_state["paper_trade_counter"] = 0
+def clear_all_trades(instrument: str = "NIFTY"):
+    st.session_state[f"paper_trades_{instrument}"] = []
+    st.session_state[f"paper_trade_counter_{instrument}"] = 0
+    st.session_state[f"chart_rec_trades_{instrument}"] = []
+
+
+# ── Chart recommendation trades (spot-level, separate from option paper trades) ──
+
+def add_chart_rec_trade(pattern_name: str, signal: str, entry: float,
+                        sl: float, target: float, rr,
+                        entry_time: str, exit_time: str, status: str,
+                        instrument: str = "NIFTY"):
+    """Record a spot-level recommendation trade (no option pricing)."""
+    init_paper_trades(instrument)
+    key = f"chart_rec_trades_{instrument}"
+    trade_key = f"{pattern_name}_{signal}_{entry}_{instrument}"
+    if any(t["key"] == trade_key for t in st.session_state[key]):
+        return
+    st.session_state[key].append({
+        "key": trade_key,
+        "time": entry_time or "",
+        "pattern": pattern_name,
+        "signal": signal,
+        "entry": round(float(entry), 2),
+        "stop_loss": round(float(sl), 2),
+        "target": round(float(target), 2),
+        "rr": rr,
+        "exit_time": exit_time or "",
+        "status": status,
+    })
+
+
+def get_chart_rec_trades_df(instrument: str = "NIFTY") -> pd.DataFrame:
+    """Return the spot-level chart recommendation trades."""
+    init_paper_trades(instrument)
+    data = st.session_state.get(f"chart_rec_trades_{instrument}", [])
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    if "key" in df.columns:
+        df = df.drop(columns=["key"])
+    return df

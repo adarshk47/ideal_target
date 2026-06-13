@@ -919,3 +919,358 @@ def fetch_ltp(token: str = NIFTY_TOKEN) -> float:
         logger.error(f"LTP fetch error: {e}")
         candles = fetch_candle_data(1, 2)
         return float(candles["close"].iloc[-1]) if not candles.empty else 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-instrument support — Nifty50, Sensex, SBIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+INSTRUMENT_CONFIG = {
+    "NIFTY": {
+        "display_name": "Nifty 50",
+        "icon": "📈",
+        "token": NIFTY_TOKEN,
+        "exchange": "NSE",
+        "opt_exchange": "NFO",
+        "search_prefix": "NIFTY",
+        "ltp_symbol": "NIFTY 50",
+        "strike_gap": 50,
+        "lot_size": 75,
+        "expiry_weekday": 1,    # Tuesday
+    },
+    "SENSEX": {
+        "display_name": "Sensex",
+        "icon": "📊",
+        "token": "99919000",    # BSE SENSEX index token
+        "exchange": "BSE",
+        "opt_exchange": "BFO",
+        "search_prefix": "SENSEX",
+        "ltp_symbol": "SENSEX",
+        "strike_gap": 100,
+        "lot_size": 10,
+        "expiry_weekday": 4,    # Friday (BSE weekly)
+    },
+    "SBIN": {
+        "display_name": "SBIN",
+        "icon": "🏦",
+        "token": None,          # discovered dynamically via searchScrip
+        "exchange": "NSE",
+        "opt_exchange": "NFO",
+        "search_prefix": "SBIN",
+        "ltp_symbol": "SBIN",
+        "strike_gap": 5,
+        "lot_size": 1500,
+        "expiry_weekday": 3,    # Thursday (monthly stock options)
+    },
+}
+
+# Caches for dynamically discovered tokens and expiries
+_INSTR_TOKEN_CACHE: dict = {}
+_INSTR_EXPIRY_CACHE: dict = {}
+
+
+def _discover_instrument_token(key: str) -> str:
+    """Search AngelOne for an instrument's cash-market token."""
+    cfg = INSTRUMENT_CONFIG.get(key, {})
+    if cfg.get("token"):
+        return cfg["token"]
+    cached = _INSTR_TOKEN_CACHE.get(key)
+    if cached:
+        return cached
+    obj = get_client()
+    if obj is None:
+        return ""
+    try:
+        exchange = cfg.get("exchange", "NSE")
+        res = obj.searchScrip(exchange, key)
+        if res and res.get("status") and res.get("data"):
+            for item in res["data"]:
+                ts = str(item.get("tradingsymbol", "")).upper()
+                itype = str(item.get("instrumenttype", "")).upper()
+                if ts == key.upper() and itype in ("", "EQ", "AMXIDX", "INDEX"):
+                    tok = str(item.get("symboltoken", ""))
+                    if tok:
+                        _INSTR_TOKEN_CACHE[key] = tok
+                        return tok
+    except Exception as e:
+        logger.warning(f"Token discovery for {key}: {e}")
+    return ""
+
+
+@st.cache_data(ttl=10)
+def fetch_ltp_for(key: str) -> float:
+    """Fetch last-traded price for any instrument key."""
+    if key == "NIFTY":
+        return fetch_ltp()
+    cfg = INSTRUMENT_CONFIG.get(key, {})
+    obj = get_client()
+    if obj is None:
+        return 0.0
+    try:
+        token = _discover_instrument_token(key)
+        if not token:
+            return 0.0
+        exchange = cfg.get("exchange", "NSE")
+        symbol = cfg.get("ltp_symbol", key)
+        resp = obj.ltpData(exchange, symbol, token)
+        if resp and resp.get("status") and resp.get("data"):
+            return float(resp["data"].get("ltp", 0) or 0)
+        # fallback: last candle close
+        cdf = fetch_candle_data_for.__wrapped__(key, 1, 2) if hasattr(fetch_candle_data_for, "__wrapped__") else pd.DataFrame()
+        return float(cdf["close"].iloc[-1]) if not cdf.empty else 0.0
+    except Exception as e:
+        logger.error(f"LTP for {key}: {e}")
+        return 0.0
+
+
+@st.cache_data(ttl=10)
+def fetch_candle_data_for(key: str, interval_minutes: int = 5,
+                          lookback_bars: int = 200) -> pd.DataFrame:
+    """Fetch OHLCV candles for any instrument."""
+    if key == "NIFTY":
+        return fetch_candle_data(interval_minutes, lookback_bars)
+    cfg = INSTRUMENT_CONFIG.get(key, {})
+    if not cfg:
+        return _EMPTY_CANDLES.copy()
+    obj = get_client()
+    if obj is None:
+        return _EMPTY_CANDLES.copy()
+    try:
+        token = _discover_instrument_token(key)
+        if not token:
+            return _EMPTY_CANDLES.copy()
+        interval_str = INTERVAL_MAP.get(interval_minutes, "FIVE_MINUTE")
+        now = datetime.now(IST)
+        lookback_minutes = interval_minutes * lookback_bars
+        from_dt = now - timedelta(minutes=lookback_minutes + 30)
+        earliest = now - timedelta(days=6)
+        if from_dt > earliest:
+            from_dt = earliest
+        params = {
+            "exchange": cfg["exchange"],
+            "symboltoken": token,
+            "interval": interval_str,
+            "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
+            "todate": now.strftime("%Y-%m-%d %H:%M"),
+        }
+        resp = obj.getCandleData(params)
+        if resp and resp.get("status") and resp.get("data"):
+            df = pd.DataFrame(resp["data"],
+                              columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df.dropna(inplace=True)
+            return df
+    except Exception as e:
+        logger.error(f"Candle data for {key}: {e}")
+    return _EMPTY_CANDLES.copy()
+
+
+def get_next_expiry_for(key: str):
+    """Get next expiry datetime for any instrument."""
+    if key == "NIFTY":
+        return get_next_weekly_expiry()
+    cfg = INSTRUMENT_CONFIG.get(key, {})
+    if not cfg:
+        return None
+    now = datetime.now(IST)
+    # Check module-level cache
+    cached = _INSTR_EXPIRY_CACHE.get(key)
+    if cached and isinstance(cached, dict):
+        dt = cached.get("dt")
+        ts = cached.get("ts", 0)
+        if dt and dt.date() >= now.date() and (time.time() - ts) < 1800:
+            return dt
+    # Discover via searchScrip on the options exchange
+    obj = get_client()
+    if obj is not None:
+        try:
+            import re
+            opt_exc = cfg.get("opt_exchange", "NFO")
+            prefix = cfg.get("search_prefix", key)
+            res = obj.searchScrip(opt_exc, prefix)
+            if res and res.get("status") and res.get("data"):
+                dates = set()
+                for item in res["data"]:
+                    sym = str(item.get("tradingsymbol", "")).upper()
+                    m = re.search(r"(\d{2}[A-Z]{3}\d{2})\d+(?:CE|PE)$", sym)
+                    if m:
+                        try:
+                            d = datetime.strptime(m.group(1), "%d%b%y").date()
+                            dates.add(d)
+                        except Exception:
+                            pass
+                if dates:
+                    nearest = _nearest_future_expiry(sorted(dates), now)
+                    if nearest:
+                        expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
+                        _INSTR_EXPIRY_CACHE[key] = {"dt": expiry_dt, "ts": time.time()}
+                        return expiry_dt
+        except Exception as e:
+            logger.warning(f"Expiry discovery for {key}: {e}")
+    # Fallback: calculate from expiry_weekday
+    wd = cfg.get("expiry_weekday", 3)
+    today = now.date()
+    days_ahead = (wd - today.weekday()) % 7
+    if days_ahead == 0:
+        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now > mkt_close:
+            days_ahead = 7
+    next_exp = today + timedelta(days=days_ahead)
+    return datetime.combine(next_exp, datetime.min.time()).replace(tzinfo=IST)
+
+
+def fetch_options_chain_for(key: str, expiry_str: str = None) -> pd.DataFrame:
+    """
+    Fetch options chain for any instrument. NIFTY delegates to fetch_options_chain().
+    SENSEX / SBIN: discovers contracts via searchScrip, fetches LTPs in batches,
+    computes Greeks via Black-Scholes.
+    """
+    if key == "NIFTY":
+        return fetch_options_chain(expiry_str)
+    cfg = INSTRUMENT_CONFIG.get(key, {})
+    if not cfg:
+        return pd.DataFrame()
+    obj = get_client()
+    if obj is None:
+        return pd.DataFrame()
+
+    import re
+    opt_exc = cfg["opt_exchange"]
+    prefix = cfg["search_prefix"]
+    strike_gap = cfg.get("strike_gap", 50)
+
+    # Resolve expiry date
+    expiry_dt = None
+    if expiry_str and expiry_str != "---":
+        try:
+            expiry_dt = datetime.strptime(expiry_str, "%d%b%Y")
+        except Exception:
+            pass
+
+    # Discover option contracts
+    queries = [prefix]
+    if expiry_dt:
+        ddmon = expiry_dt.strftime("%d%b").upper()
+        yy = expiry_dt.strftime("%y")
+        yyyy = expiry_dt.strftime("%Y")
+        queries = [f"{prefix}{ddmon}{yy}", f"{prefix}{ddmon}{yyyy}", prefix]
+
+    rows: dict = {}
+    for q in queries:
+        try:
+            res = obj.searchScrip(opt_exc, q)
+        except Exception:
+            continue
+        if not (res and res.get("status") and res.get("data")):
+            continue
+        for item in res["data"]:
+            sym = str(item.get("tradingsymbol", "")).upper()
+            tok = str(item.get("symboltoken", ""))
+            if not sym.endswith(("CE", "PE")) or not tok:
+                continue
+            opt_type = sym[-2:]
+            # Match expiry in symbol
+            m = re.search(r"(\d{2}[A-Z]{3}\d{2})\d+(?:CE|PE)$", sym)
+            if not m:
+                continue
+            try:
+                sym_exp = datetime.strptime(m.group(1), "%d%b%y").date()
+            except Exception:
+                continue
+            if expiry_dt and sym_exp != expiry_dt.date():
+                continue
+            # Parse strike
+            sm = re.search(r"(\d+)(CE|PE)$", sym)
+            if not sm:
+                continue
+            try:
+                strike = float(sm.group(1))
+            except Exception:
+                continue
+            rows[(strike, opt_type)] = {"strike": strike, "option_type": opt_type,
+                                        "token": tok, "symbol": sym}
+        if rows:
+            break
+
+    if not rows:
+        return pd.DataFrame()
+
+    # Spot price → filter ATM ± 12 strikes
+    spot = fetch_ltp_for(key)
+    if spot <= 0:
+        return pd.DataFrame()
+    atm = round(spot / strike_gap) * strike_gap
+    n = 12
+    lo_strike = atm - n * strike_gap
+    hi_strike = atm + n * strike_gap
+
+    # Build chain dict keyed by strike
+    chain: dict = {}
+    for (strike, opt_type), info in rows.items():
+        if not (lo_strike <= strike <= hi_strike):
+            continue
+        if strike not in chain:
+            chain[strike] = {
+                "strike": strike,
+                "ce_ltp": 0.0, "pe_ltp": 0.0,
+                "ce_oi": 0, "pe_oi": 0,
+                "ce_volume": 0, "pe_volume": 0,
+                "ce_token": "", "pe_token": "",
+                "ce_bid": 0.0, "pe_bid": 0.0,
+                "ce_ask": 0.0, "pe_ask": 0.0,
+            }
+        side = "ce" if opt_type == "CE" else "pe"
+        chain[strike][f"{side}_token"] = info["token"]
+
+    if not chain:
+        return pd.DataFrame()
+
+    # Batch-fetch market data (LTP, OI, volume)
+    tokens_meta = []
+    for s_data in chain.values():
+        for side in ("ce", "pe"):
+            tok = s_data.get(f"{side}_token", "")
+            if tok:
+                tokens_meta.append({"token": tok, "strike": s_data["strike"], "side": side})
+
+    for batch in _chunked(tokens_meta, 50):
+        try:
+            token_list = [t["token"] for t in batch]
+            quotes = obj.getMarketData("FULL", {opt_exc: token_list})
+            if quotes and quotes.get("status") and quotes.get("data"):
+                fetched = quotes["data"].get(opt_exc, {})
+                for t in batch:
+                    td = fetched.get(t["token"])
+                    if td:
+                        s = t["strike"]
+                        side = t["side"]
+                        chain[s][f"{side}_ltp"] = float(td.get("ltp", 0) or 0)
+                        chain[s][f"{side}_oi"] = int(td.get("opnInterest", 0) or 0)
+                        chain[s][f"{side}_volume"] = int(td.get("tradeVolume", 0) or 0)
+                        chain[s][f"{side}_bid"] = float(td.get("bestBid", 0) or 0)
+                        chain[s][f"{side}_ask"] = float(td.get("bestAsk", 0) or 0)
+        except Exception as e:
+            logger.warning(f"Market data batch for {key}: {e}")
+
+    df = pd.DataFrame(list(chain.values()))
+    df.sort_values("strike", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Add zero-filled Greek columns (filled by compute_chain_greeks below)
+    for col in ["ce_iv", "pe_iv", "ce_delta", "pe_delta",
+                "ce_gamma", "pe_gamma", "ce_theta", "pe_theta", "ce_vega", "pe_vega"]:
+        df[col] = 0.0
+
+    # Greeks via Black-Scholes
+    try:
+        from modules.black_scholes import compute_chain_greeks
+        expiry_dt_obj = (datetime.combine(expiry_dt.date(), datetime.min.time()).replace(tzinfo=IST)
+                         if expiry_dt else get_next_expiry_for(key))
+        df = compute_chain_greeks(df, spot, expiry_dt_obj, datetime.now(IST))
+    except Exception as e:
+        logger.warning(f"Greeks for {key}: {e}")
+
+    return df

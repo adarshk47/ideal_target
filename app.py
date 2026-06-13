@@ -654,8 +654,18 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
 
                 # For simulation: determine exit outcome from candle data
                 exit_info = None
+                entry_time = None
                 if sim and candle_df is not None and not candle_df.empty:
                     entry_idx = getattr(pat, "index", getattr(pat, "bar_index", -1))
+                    # Entry is timed to the pattern candle, not the current
+                    # wall-clock — so entry precedes exit in the trade log.
+                    if 0 <= entry_idx < len(candle_df):
+                        try:
+                            entry_time = pd.Timestamp(
+                                candle_df["timestamp"].iloc[entry_idx]
+                            ).strftime("%H:%M:%S")
+                        except Exception:
+                            entry_time = None
                     exit_ts, exit_status = _scan_exit(
                         candle_df, entry_idx, pat.signal,
                         float(pat.stop_loss), float(pat.target),
@@ -666,7 +676,8 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
 
                 add_paper_trade(pat, pat_name, effective_spot,
                                 source="AUTO", simulated=sim,
-                                option_ltp=option_ltp, exit_info=exit_info)
+                                option_ltp=option_ltp, exit_info=exit_info,
+                                entry_time=entry_time)
 
     # Update open trade statuses
     update_paper_trades(spot)

@@ -31,17 +31,26 @@ def init_paper_trades():
 
 def add_paper_trade(signal, pattern_name: str, spot_price: float,
                     source: str = "AUTO", simulated: bool = False,
-                    option_ltp: float = 0.0, exit_info: dict = None):
+                    option_ltp: float = 0.0, exit_info: dict = None,
+                    entry_time: str = None):
     """Add a new paper trade from a pattern signal.
 
     option_ltp: if > 1, use as option premium entry price (with 25% risk stop).
     exit_info:  {'status': 'PROFIT'|'LOSS', 'exit_time': 'HH:MM:SS'|None}
                 from candle-scan; takes priority over R:R simulation.
+    entry_time: 'HH:MM:SS' of the pattern candle. In simulation the entry must
+                be timed to the candle that triggered the signal — not the
+                current wall-clock time — otherwise entry/exit times are
+                inconsistent (entry would appear after the exit).
     """
     init_paper_trades()
     now = datetime.now(IST)
     st.session_state["paper_trade_counter"] += 1
     trade_id = st.session_state["paper_trade_counter"]
+
+    # Entry timestamp: the pattern candle time when provided (simulation),
+    # otherwise the live wall-clock time.
+    trade_time = entry_time if entry_time else now.strftime("%H:%M:%S")
 
     atm = round(spot_price / 50) * 50
     option_type = "CE" if signal.signal == "BUY" else "PE"
@@ -119,11 +128,13 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
                         pnl = round(entry - sim_exit, 2)
 
             pnl_pct = round(pnl / entry * 100, 2) if entry else 0.0
-            exit_time = now.strftime("%H:%M:%S")
+            # No candle-confirmed exit; leave exit_time blank rather than
+            # stamping the (post-market) wall-clock time.
+            exit_time = None
 
     trade = {
         "id": trade_id,
-        "time": now.strftime("%H:%M:%S"),
+        "time": trade_time,
         "date": now.strftime("%d-%b-%Y"),
         "pattern": pattern_name,
         "signal": signal.signal,

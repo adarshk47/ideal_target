@@ -68,7 +68,10 @@ def get_client():
             return None
 
     except ImportError:
-        st.error("smartapi-python not installed. Run: pip install smartapi-python")
+        if not st.session_state.get("_smartapi_warn_shown"):
+            st.session_state["_smartapi_warn_shown"] = True
+            st.warning("smartapi-python not installed — running in DEMO mode. Run: pip install smartapi-python")
+        st.session_state["angel_client_valid"] = False
         return None
     except Exception as e:
         logger.error(f"AngelOne login error: {e}")
@@ -88,20 +91,20 @@ def is_market_open() -> bool:
 
 def get_next_weekly_expiry() -> datetime:
     """
-    Get the next weekly Nifty expiry date (every Thursday).
-    If today is Thursday and market is still open, return today.
+    Get the next weekly Nifty expiry date (every Tuesday).
+    If today is Tuesday and market is still open, return today.
     """
     now = datetime.now(IST)
     today = now.date()
-    # Thursday = weekday 3
-    days_until_thursday = (3 - today.weekday()) % 7
-    if days_until_thursday == 0:
-        # Today is Thursday
+    # Tuesday = weekday 1
+    days_until_tuesday = (1 - today.weekday()) % 7
+    if days_until_tuesday == 0:
+        # Today is Tuesday
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
         if now > market_close:
-            # Today's expiry has closed, get next Thursday
-            days_until_thursday = 7
-    expiry_date = today + timedelta(days=days_until_thursday)
+            # Today's expiry has closed, get next Tuesday
+            days_until_tuesday = 7
+    expiry_date = today + timedelta(days=days_until_tuesday)
     return datetime.combine(expiry_date, datetime.min.time()).replace(tzinfo=IST)
 
 

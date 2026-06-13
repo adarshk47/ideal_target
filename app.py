@@ -71,7 +71,7 @@ try:
         fetch_candle_data, fetch_options_chain, fetch_ltp,
         get_next_weekly_expiry, get_expiry_string, get_expiry_countdown,
         is_market_open, get_atm_strike, get_strike_range, INTERVAL_MAP,
-        is_connected, get_data_source,
+        is_connected, get_data_source, get_client, get_last_error,
     )
     from modules.pattern_detector import detect_all_patterns
     from modules.oi_analyzer import (
@@ -852,6 +852,38 @@ def render_best_trade_tab(patterns, options_df: pd.DataFrame, spot: float, oi_de
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────────────────────────────────────
+def render_connect_panel(connected: bool):
+    """Show a Connect button + diagnostics when not connected to AngelOne."""
+    if connected:
+        return
+    cols = st.columns([2, 6])
+    with cols[0]:
+        if st.button("🔌 Connect to AngelOne", type="primary", use_container_width=True):
+            with st.spinner("Logging in to AngelOne…"):
+                obj = get_client(force=True)
+            if obj is not None:
+                st.success("Connected! Loading live data…")
+                st.rerun()
+            else:
+                st.error("Connection failed — see details below.")
+    with cols[1]:
+        err = get_last_error()
+        if err:
+            st.error(f"⚠️ {err}")
+        else:
+            st.info("Add your AngelOne API secrets, then click Connect.")
+    with st.expander("ℹ️ Secrets format (Streamlit → Settings → Secrets)"):
+        st.code(
+            '[angel_one]\n'
+            'api_key     = "your_api_key"\n'
+            'client_id   = "your_client_code"\n'
+            'mpin        = "your_mpin"        # or password = "..."\n'
+            'totp_secret = "your_totp_base32_secret"\n',
+            language="toml",
+        )
+    st.markdown("<hr style='border-color:#2d3250;margin:6px 0;'>", unsafe_allow_html=True)
+
+
 def main():
     if not MODULES_OK:
         st.stop()
@@ -862,6 +894,7 @@ def main():
     connected = is_connected()
 
     render_header(ltp, spot_prev, connected)
+    render_connect_panel(connected)
 
     # Timeframe selector for chart
     tf_options = {1: "1 min", 2: "2 min", 5: "5 min", 10: "10 min",

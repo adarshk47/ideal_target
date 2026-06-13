@@ -31,52 +31,113 @@ INTERVAL_MAP = {
 }
 
 
-def get_client():
+def _read_secrets() -> dict:
+    """
+    Read AngelOne credentials from st.secrets, supporting either section name
+    ([angel_one] or [angelone]) and either 'mpin' or 'password' for login.
+    """
+    section = {}
+    for key in ("angel_one", "angelone", "ANGEL_ONE", "ANGELONE"):
+        try:
+            if key in st.secrets:
+                section = st.secrets[key]
+                break
+        except Exception:
+            continue
+    # Fall back to a flat layout (keys at top level)
+    if not section:
+        section = st.secrets
+
+    def g(*names):
+        for n in names:
+            try:
+                if n in section and section[n]:
+                    return str(section[n])
+            except Exception:
+                pass
+        return ""
+
+    return {
+        "api_key": g("api_key", "apikey", "key"),
+        "client_id": g("client_id", "clientid", "client_code", "clientcode"),
+        # AngelOne login now uses MPIN; fall back to password for older setups
+        "login_pwd": g("mpin", "pin", "password"),
+        "totp_secret": g("totp_secret", "totp", "totp_key"),
+    }
+
+
+def get_client(force: bool = False):
     """
     Get or create an AngelOne SmartConnect client session.
-    Uses st.session_state to cache the client across reruns.
+    Caches the client in st.session_state. Stores the last error message in
+    st.session_state['angel_error'] so the UI can show why login failed.
+    Pass force=True to retry a fresh login (used by the Connect button).
     Returns the SmartConnect object or None on failure.
     """
-    if "angel_client" in st.session_state and st.session_state.get("angel_client_valid", False):
-        # Reuse existing authenticated session
+    if force:
+        st.session_state.pop("angel_client", None)
+        st.session_state["angel_client_valid"] = False
+
+    if st.session_state.get("angel_client") is not None and \
+            st.session_state.get("angel_client_valid", False):
         return st.session_state["angel_client"]
 
+    st.session_state["angel_error"] = ""
     try:
         from SmartApi import SmartConnect  # smartapi-python package
+    except ImportError as e:
+        st.session_state["angel_client_valid"] = False
+        st.session_state["angel_error"] = (
+            f"smartapi-python (or a dependency like logzero) not installed: {e}"
+        )
+        return None
 
-        secrets = st.secrets.get("angelone", {})
-        api_key = secrets.get("api_key", "")
-        client_id = secrets.get("client_id", "")
-        password = secrets.get("password", "")
-        totp_secret = secrets.get("totp_secret", "")
+    creds = _read_secrets()
+    missing = [k for k in ("api_key", "client_id", "login_pwd", "totp_secret")
+               if not creds.get(k)]
+    if missing:
+        st.session_state["angel_client_valid"] = False
+        st.session_state["angel_error"] = (
+            "Missing credentials in secrets: " + ", ".join(missing) +
+            ". Expected a [angel_one] section with api_key, client_id, "
+            "mpin (or password) and totp_secret."
+        )
+        return None
 
-        if not all([api_key, client_id, password, totp_secret]):
-            st.session_state["angel_client_valid"] = False
-            return None
-
-        obj = SmartConnect(api_key=api_key)
-        totp = pyotp.TOTP(totp_secret).now()
-        data = obj.generateSession(client_id, password, totp)
+    try:
+        obj = SmartConnect(api_key=creds["api_key"])
+        totp = pyotp.TOTP(creds["totp_secret"]).now()
+        data = obj.generateSession(creds["client_id"], creds["login_pwd"], totp)
 
         if data and data.get("status"):
+            try:
+                obj.getfeedToken()
+            except Exception:
+                pass
             st.session_state["angel_client"] = obj
             st.session_state["angel_client_valid"] = True
             st.session_state["angel_auth_token"] = data["data"]["jwtToken"]
+            st.session_state["angel_error"] = ""
             return obj
-        else:
-            st.session_state["angel_client_valid"] = False
-            return None
 
-    except ImportError:
-        if not st.session_state.get("_smartapi_warn_shown"):
-            st.session_state["_smartapi_warn_shown"] = True
-            st.warning("smartapi-python not installed — running in DEMO mode. Run: pip install smartapi-python")
+        # Login returned a failure payload — surface the API message
+        msg = ""
+        if isinstance(data, dict):
+            msg = data.get("message") or data.get("errorcode") or str(data)
         st.session_state["angel_client_valid"] = False
+        st.session_state["angel_error"] = f"Login failed: {msg}"
         return None
+
     except Exception as e:
         logger.error(f"AngelOne login error: {e}")
         st.session_state["angel_client_valid"] = False
+        st.session_state["angel_error"] = f"Login error: {e}"
         return None
+
+
+def get_last_error() -> str:
+    """Return the last connection error message (empty string if none)."""
+    return st.session_state.get("angel_error", "")
 
 
 def is_connected() -> bool:
@@ -254,11 +315,63 @@ def fetch_candle_data(interval_minutes: int = 1, lookback_bars: int = 200) -> pd
         return _EMPTY_CANDLES.copy()
 
 
+_SCRIP_MASTER_URL = (
+    "https://margincalculator.angelbroking.com/OpenAPI_File/files/"
+    "OpenAPISymbolMaster.json"
+)
+
+
+@st.cache_data(ttl=3600)
+def _load_nifty_option_master(expiry_str: str) -> pd.DataFrame:
+    """
+    Download the NFO scrip master and return NIFTY index options for the
+    given expiry. Columns: strike, option_type (CE/PE), token, symbol.
+    Cached for an hour (the master changes at most daily).
+    """
+    import requests
+
+    resp = requests.get(_SCRIP_MASTER_URL, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    rows = []
+    target = expiry_str.upper()
+    for item in data:
+        if item.get("name") != "NIFTY":
+            continue
+        if item.get("instrumenttype") != "OPTIDX":
+            continue
+        if str(item.get("expiry", "")).upper() != target:
+            continue
+        symbol = item.get("symbol", "")
+        opt_type = "CE" if symbol.endswith("CE") else "PE" if symbol.endswith("PE") else None
+        if opt_type is None:
+            continue
+        try:
+            strike = float(item.get("strike", 0)) / 100.0  # master strike is in paise
+        except Exception:
+            continue
+        rows.append({
+            "strike": strike,
+            "option_type": opt_type,
+            "token": str(item.get("token", "")),
+            "symbol": symbol,
+        })
+    return pd.DataFrame(rows)
+
+
+def _chunked(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
 @st.cache_data(ttl=10)
 def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
     """
-    Fetch options chain data including greeks from AngelOne.
-    Returns DataFrame with strike, CE/PE OI, volume, IV, delta, gamma, theta, vega.
+    Fetch the NIFTY options chain (ATM ±12 strikes) from AngelOne:
+      • getMarketData(FULL) → OI, volume, LTP, best bid/ask per strike
+      • optionGreek         → delta, gamma, theta, vega, IV per strike
+    Returns one row per strike with ce_*/pe_* columns.
     Returns an empty DataFrame if not connected — no simulated data.
     """
     try:
@@ -270,42 +383,93 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
         if obj is None:
             return pd.DataFrame()
 
-        response = obj.getOptionGreeks({"name": "NIFTY", "expirydate": expiry_str})
+        master = _load_nifty_option_master(expiry_str)
+        if master.empty:
+            logger.error(f"No NIFTY options found in master for expiry {expiry_str}")
+            return pd.DataFrame()
 
-        if response and response.get("status") and response.get("data"):
-            data = response["data"]
-            rows = []
-            for item in data:
-                strike = float(item.get("strikePrice", 0))
-                rows.append({
-                    "strike": strike,
-                    "ce_oi": int(item.get("CE", {}).get("openInterest", 0)),
-                    "ce_volume": int(item.get("CE", {}).get("tradedVolume", 0)),
-                    "ce_iv": float(item.get("CE", {}).get("impliedVolatility", 0)),
-                    "ce_delta": float(item.get("CE", {}).get("delta", 0)),
-                    "ce_gamma": float(item.get("CE", {}).get("gamma", 0)),
-                    "ce_theta": float(item.get("CE", {}).get("theta", 0)),
-                    "ce_vega": float(item.get("CE", {}).get("vega", 0)),
-                    "ce_ltp": float(item.get("CE", {}).get("lastPrice", 0)),
-                    "ce_bid": float(item.get("CE", {}).get("bidPrice", 0)),
-                    "ce_ask": float(item.get("CE", {}).get("askPrice", 0)),
-                    "pe_oi": int(item.get("PE", {}).get("openInterest", 0)),
-                    "pe_volume": int(item.get("PE", {}).get("tradedVolume", 0)),
-                    "pe_iv": float(item.get("PE", {}).get("impliedVolatility", 0)),
-                    "pe_delta": float(item.get("PE", {}).get("delta", 0)),
-                    "pe_gamma": float(item.get("PE", {}).get("gamma", 0)),
-                    "pe_theta": float(item.get("PE", {}).get("theta", 0)),
-                    "pe_vega": float(item.get("PE", {}).get("vega", 0)),
-                    "pe_ltp": float(item.get("PE", {}).get("lastPrice", 0)),
-                    "pe_bid": float(item.get("PE", {}).get("bidPrice", 0)),
-                    "pe_ask": float(item.get("PE", {}).get("askPrice", 0)),
-                })
-            df = pd.DataFrame(rows)
-            df.sort_values("strike", inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            return df
+        # Limit to ATM ±12 strikes to stay within the 50-token market-data cap
+        spot = fetch_ltp()
+        all_strikes = sorted(master["strike"].unique())
+        if spot and spot > 0:
+            atm = min(all_strikes, key=lambda s: abs(s - spot))
+            atm_idx = all_strikes.index(atm)
+            lo = max(0, atm_idx - 12)
+            hi = min(len(all_strikes), atm_idx + 13)
+            keep = set(all_strikes[lo:hi])
+            master = master[master["strike"].isin(keep)]
 
-        return pd.DataFrame()
+        token_to_meta = {
+            r["token"]: (r["strike"], r["option_type"])
+            for _, r in master.iterrows()
+        }
+        tokens = list(token_to_meta.keys())
+
+        # ── Market data (OI / volume / LTP / depth) ──────────────────────────
+        md_by_token = {}
+        for batch in _chunked(tokens, 50):
+            try:
+                md = obj.getMarketData("FULL", {"NFO": batch})
+                if md and md.get("status") and md.get("data"):
+                    for item in md["data"].get("fetched", []):
+                        md_by_token[str(item.get("symbolToken"))] = item
+            except Exception as e:
+                logger.error(f"getMarketData error: {e}")
+
+        # ── Greeks (delta / gamma / theta / vega / IV) ───────────────────────
+        greeks_by_key = {}
+        try:
+            gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
+            if gr and gr.get("status") and gr.get("data"):
+                for g in gr["data"]:
+                    try:
+                        k = (float(g.get("strikePrice", 0)), g.get("optionType", "").upper())
+                        greeks_by_key[k] = g
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"optionGreek error: {e}")
+
+        def _best_depth(item, side):
+            try:
+                lvls = item.get("depth", {}).get(side, [])
+                return float(lvls[0].get("price", 0)) if lvls else 0.0
+            except Exception:
+                return 0.0
+
+        # ── Assemble per-strike rows ─────────────────────────────────────────
+        strikes = sorted(master["strike"].unique())
+        rows = []
+        for strike in strikes:
+            row = {"strike": float(strike)}
+            for opt in ("ce", "pe"):
+                ot = opt.upper()
+                sub = master[(master["strike"] == strike) & (master["option_type"] == ot)]
+                md = md_by_token.get(sub["token"].iloc[0]) if not sub.empty else None
+                g = greeks_by_key.get((float(strike), ot), {})
+                if md:
+                    row[f"{opt}_oi"] = int(float(md.get("opnInterest", 0) or 0))
+                    row[f"{opt}_volume"] = int(float(md.get("tradeVolume", 0) or 0))
+                    row[f"{opt}_ltp"] = float(md.get("ltp", 0) or 0)
+                    row[f"{opt}_bid"] = _best_depth(md, "buy")
+                    row[f"{opt}_ask"] = _best_depth(md, "sell")
+                else:
+                    row[f"{opt}_oi"] = 0
+                    row[f"{opt}_volume"] = 0
+                    row[f"{opt}_ltp"] = 0.0
+                    row[f"{opt}_bid"] = 0.0
+                    row[f"{opt}_ask"] = 0.0
+                row[f"{opt}_iv"] = float(g.get("impliedVolatility", 0) or 0)
+                row[f"{opt}_delta"] = float(g.get("delta", 0) or 0)
+                row[f"{opt}_gamma"] = float(g.get("gamma", 0) or 0)
+                row[f"{opt}_theta"] = float(g.get("theta", 0) or 0)
+                row[f"{opt}_vega"] = float(g.get("vega", 0) or 0)
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df.sort_values("strike", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
 
     except Exception as e:
         logger.error(f"Options chain error: {e}")

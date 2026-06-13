@@ -155,15 +155,19 @@ def render_header(ltp: float, spot_prev: float, connected: bool):
     chg_pct = chg / spot_prev * 100 if spot_prev else 0
     chg_color = "#00ff88" if chg >= 0 else "#ff4444"
     chg_sign = "+" if chg >= 0 else ""
-    is_expiry_today = expiry_dt.date() == now.date()
+    ltp_str = f"{ltp:,.2f}" if ltp else "---"
+    chg_str = f"{chg_sign}{chg:.2f} ({chg_sign}{chg_pct:.2f}%)" if ltp else "Connect to AngelOne"
+    is_expiry_today = (expiry_dt is not None and expiry_dt.date() == now.date())
+    expiry_day_str = "📅 TODAY!" if is_expiry_today else (
+        expiry_dt.strftime("%A") if expiry_dt else "---")
 
     col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 2])
     with col1:
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">NIFTY 50</div>
-            <div class="metric-value" style="color:{chg_color};">{ltp:,.2f}</div>
-            <div class="metric-sub" style="color:{chg_color};">{chg_sign}{chg:.2f} ({chg_sign}{chg_pct:.2f}%)</div>
+            <div class="metric-value" style="color:{chg_color if ltp else '#888'};">{ltp_str}</div>
+            <div class="metric-sub" style="color:{chg_color if ltp else '#666'};">{chg_str}</div>
         </div>""", unsafe_allow_html=True)
     with col2:
         st.markdown(f"""
@@ -177,7 +181,7 @@ def render_header(ltp: float, spot_prev: float, connected: bool):
         <div class="metric-card">
             <div class="metric-label">Weekly Expiry</div>
             <div class="metric-value" style="font-size:18px; color:#ffd700;">{expiry_str}</div>
-            <div class="metric-sub">{'📅 TODAY!' if is_expiry_today else expiry_dt.strftime('%A')}</div>
+            <div class="metric-sub">{expiry_day_str}</div>
         </div>""", unsafe_allow_html=True)
     with col4:
         cntdwn_color = "#ff4444" if is_expiry_today else "#ffd700"
@@ -580,21 +584,22 @@ def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_
 def render_paper_trade_tab(patterns, spot: float):
     st.markdown("### 📝 Paper Trading – Auto Signals")
     market_open = is_market_open()
+    effective_spot = spot if spot and spot > 0 else st.session_state.get("_last_ltp", 22000.0)
 
     if not market_open:
-        st.error("🔴 Market Closed – Paper trading paused. No new trades.")
-        closed_df = get_trades_df()
-        if not closed_df.empty:
-            st.markdown("#### Today's Completed Trades")
-            st.dataframe(closed_df, use_container_width=True, hide_index=True)
-        return
+        st.warning("🔴 Market Closed — showing **simulation** results based on chart patterns "
+                   "detected from last session data.")
 
     # Auto-add trades from patterns
-    if patterns and market_open:
+    # Live mode: OPEN trades tracked in real-time
+    # Closed mode: simulate all chart-recommended signals immediately
+    if patterns:
         for pat in patterns:
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
-            if should_add_new_trade(pat_name, pat.signal):
-                add_paper_trade(pat, pat_name, spot, source="AUTO")
+            sim = not market_open
+            if should_add_new_trade(pat_name, pat.signal, simulated=sim):
+                add_paper_trade(pat, pat_name, effective_spot,
+                                source="AUTO", simulated=sim)
 
     # Update open trade statuses
     update_paper_trades(spot)
@@ -890,6 +895,10 @@ def main():
 
     # Fetch core data
     ltp = fetch_ltp()
+    if ltp and ltp > 0:
+        st.session_state["_last_ltp"] = ltp
+    else:
+        ltp = st.session_state.get("_last_ltp", 0.0)
     spot_prev = ltp * 0.9985  # approximation for prev close display
     connected = is_connected()
 
@@ -989,20 +998,34 @@ def main():
 
     # ── Auto-refresh bar at bottom ─────────────────────────────────────────
     st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-    refresh_col1, refresh_col2 = st.columns([6, 2])
-    with refresh_col1:
-        market_msg = "🟢 Live data streaming" if is_market_open() else "🔴 Market closed – showing last available data"
+    st.markdown("<hr style='border-color:#2d3250;margin:4px 0;'>", unsafe_allow_html=True)
+
+    r1, r2, r3 = st.columns([5, 2, 1])
+    with r1:
+        market_msg = ("🟢 Live data streaming" if is_market_open()
+                      else "🔴 Market closed – showing last session data")
         st.markdown(f"""
         <div class="refresh-bar">
             {market_msg} &nbsp;|&nbsp;
-            Last update: <b>{datetime.now(IST).strftime('%H:%M:%S')}</b> &nbsp;|&nbsp;
-            Refresh every: <b>5 sec</b>
+            Last update: <b>{datetime.now(IST).strftime('%H:%M:%S')}</b>
         </div>""", unsafe_allow_html=True)
-    with refresh_col2:
-        if HAS_AUTOREFRESH:
-            count = st_autorefresh(interval=5000, key="main_data_refresh", debounce=True)
-        else:
-            st.caption("Install streamlit-autorefresh for auto-refresh")
+    with r2:
+        # Persist toggle in session state so it survives reruns
+        if "autorefresh_on" not in st.session_state:
+            st.session_state["autorefresh_on"] = False  # OFF by default
+        toggled = st.toggle("Auto-refresh (5s)", value=st.session_state["autorefresh_on"],
+                            key="ar_toggle")
+        st.session_state["autorefresh_on"] = toggled
+    with r3:
+        if st.button("↺", help="Refresh now", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    # Only fire the autorefresh component when toggled ON.
+    # st_autorefresh triggers a full rerun which causes the grey flash; we place
+    # it LAST and use debounce so only one rerun fires per interval.
+    if st.session_state.get("autorefresh_on") and HAS_AUTOREFRESH:
+        st_autorefresh(interval=5000, key="main_data_refresh", debounce=True)
 
 
 if __name__ == "__main__":

@@ -219,25 +219,21 @@ def get_next_weekly_expiry() -> datetime:
         if cached_date >= today:
             return cached
 
-    # Fallback 2: scan next 7 days — pick nearest weekday that is Mon–Fri
-    # (expiry is always a weekday; we don't know which day without API,
-    # so return the soonest non-weekend day within the next 7 days)
-    for delta in range(0, 8):
-        candidate = today + timedelta(days=delta)
-        if candidate.weekday() < 5:  # Mon=0 … Fri=4
-            if candidate == today:
-                mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-                if now <= mkt_close:
-                    return datetime.combine(candidate, datetime.min.time()).replace(tzinfo=IST)
-            else:
-                return datetime.combine(candidate, datetime.min.time()).replace(tzinfo=IST)
-
-    # Absolute fallback
-    return datetime.combine(today + timedelta(days=1), datetime.min.time()).replace(tzinfo=IST)
+    # Fallback 2: no API and no cached value — return None so UI can show "---"
+    return None
 
 
-def get_expiry_countdown(expiry_dt: datetime) -> str:
-    """Return human-readable countdown string to expiry."""
+def get_expiry_string(expiry_dt) -> str:
+    """Format expiry date as AngelOne API expects, e.g. '27JUN2024'. Returns '---' if None."""
+    if expiry_dt is None:
+        return "---"
+    return expiry_dt.strftime("%d%b%Y").upper()
+
+
+def get_expiry_countdown(expiry_dt) -> str:
+    """Return human-readable countdown string to expiry. Returns '---' if None."""
+    if expiry_dt is None:
+        return "---"
     now = datetime.now(IST)
     expiry_close = expiry_dt.replace(hour=15, minute=30, second=0)
     diff = expiry_close - now
@@ -247,15 +243,9 @@ def get_expiry_countdown(expiry_dt: datetime) -> str:
     days = total_seconds // 86400
     hours = (total_seconds % 86400) // 3600
     minutes = (total_seconds % 3600) // 60
-
     if days == 0:
         return f"Expiry Today! {hours}h {minutes}m remaining"
     return f"{days}d {hours}h {minutes}m"
-
-
-def get_expiry_string(expiry_dt: datetime) -> str:
-    """Format expiry date as AngelOne API expects, e.g. '27JUN2024'."""
-    return expiry_dt.strftime("%d%b%Y").upper()
 
 
 _EMPTY_CANDLES = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])

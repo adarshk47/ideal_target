@@ -30,8 +30,14 @@ def init_paper_trades():
 
 
 def add_paper_trade(signal, pattern_name: str, spot_price: float,
-                    source: str = "AUTO", simulated: bool = False):
-    """Add a new paper trade from a pattern signal (live or simulated)."""
+                    source: str = "AUTO", simulated: bool = False,
+                    option_ltp: float = 0.0, exit_info: dict = None):
+    """Add a new paper trade from a pattern signal.
+
+    option_ltp: if > 1, use as option premium entry price (with 25% risk stop).
+    exit_info:  {'status': 'PROFIT'|'LOSS', 'exit_time': 'HH:MM:SS'|None}
+                from candle-scan; takes priority over R:R simulation.
+    """
     init_paper_trades()
     now = datetime.now(IST)
     st.session_state["paper_trade_counter"] += 1
@@ -39,56 +45,81 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
 
     atm = round(spot_price / 50) * 50
     option_type = "CE" if signal.signal == "BUY" else "PE"
+    rr = float(signal.risk_reward or 1.5)
 
-    # In simulation, immediately resolve the trade using candle data:
-    # if price reached target before SL → PROFIT, else → LOSS
+    # Determine entry basis: option premium OR spot-level signal values
+    use_option = bool(option_ltp and option_ltp > 1.0)
+    if use_option:
+        entry = round(float(option_ltp), 2)
+        risk = round(entry * 0.25, 2)          # 25% of premium as risk
+        sl = round(entry - risk, 2)
+        target = round(entry + risk * rr, 2)
+    else:
+        entry = round(float(signal.entry), 2)
+        sl = round(float(signal.stop_loss), 2)
+        target = round(float(signal.target), 2)
+        risk = abs(entry - sl)
+
     status = "OPEN"
     exit_price = None
     exit_time = None
     pnl = 0.0
     pnl_pct = 0.0
+
     if simulated:
-        # Simulate outcome: assume price moved 0.5×RR toward target
-        rr = float(signal.risk_reward or 1.0)
-        entry = float(signal.entry)
-        sl = float(signal.stop_loss)
-        target = float(signal.target)
-        risk = abs(entry - sl)
-        if signal.signal == "BUY":
-            simulated_exit = entry + risk * (rr * 0.5)
-            if simulated_exit >= target:
-                status = "PROFIT"
-                exit_price = round(target, 2)
+        # Priority 1: candle-scan provided a resolved outcome
+        if exit_info and exit_info.get("status") in ("PROFIT", "LOSS"):
+            status = exit_info["status"]
+            exit_time = exit_info.get("exit_time")
+            if status == "PROFIT":
+                exit_price = target
                 pnl = round(target - entry, 2)
-                pnl_pct = round(pnl / entry * 100, 2)
-            elif simulated_exit <= sl:
-                status = "LOSS"
-                exit_price = round(sl, 2)
+            else:
+                exit_price = sl
                 pnl = round(sl - entry, 2)
-                pnl_pct = round(pnl / entry * 100, 2)
-            else:
-                status = "PROFIT" if rr >= 1.5 else "LOSS"
-                exit_price = round(simulated_exit, 2)
-                pnl = round(simulated_exit - entry, 2)
-                pnl_pct = round(pnl / entry * 100, 2)
+            pnl_pct = round(pnl / entry * 100, 2) if entry else 0.0
+
         else:
-            simulated_exit = entry - risk * (rr * 0.5)
-            if simulated_exit <= target:
-                status = "PROFIT"
-                exit_price = round(target, 2)
-                pnl = round(entry - target, 2)
-                pnl_pct = round(pnl / entry * 100, 2)
-            elif simulated_exit >= sl:
-                status = "LOSS"
-                exit_price = round(sl, 2)
-                pnl = round(entry - sl, 2)
-                pnl_pct = round(pnl / entry * 100, 2)
+            # Priority 2: R:R-based simulation fallback
+            if use_option:
+                # Options are always bought (CE for BUY, PE for SELL) → premium goes up when right
+                sim_exit = entry + risk * (rr * 0.5)
+                if sim_exit >= target:
+                    status, exit_price = "PROFIT", target
+                elif sim_exit <= sl:
+                    status, exit_price = "LOSS", sl
+                else:
+                    status = "PROFIT" if rr >= 1.5 else "LOSS"
+                    exit_price = round(sim_exit, 2)
+                pnl = round(exit_price - entry, 2)
             else:
-                status = "PROFIT" if rr >= 1.5 else "LOSS"
-                exit_price = round(simulated_exit, 2)
-                pnl = round(entry - simulated_exit, 2)
-                pnl_pct = round(pnl / entry * 100, 2)
-        exit_time = now.strftime("%H:%M:%S")
+                if signal.signal == "BUY":
+                    sim_exit = entry + risk * (rr * 0.5)
+                    if sim_exit >= target:
+                        status, exit_price = "PROFIT", target
+                        pnl = round(target - entry, 2)
+                    elif sim_exit <= sl:
+                        status, exit_price = "LOSS", sl
+                        pnl = round(sl - entry, 2)
+                    else:
+                        status = "PROFIT" if rr >= 1.5 else "LOSS"
+                        exit_price = round(sim_exit, 2)
+                        pnl = round(sim_exit - entry, 2)
+                else:  # SELL (spot-level)
+                    sim_exit = entry - risk * (rr * 0.5)
+                    if sim_exit <= target:
+                        status, exit_price = "PROFIT", target
+                        pnl = round(entry - target, 2)
+                    elif sim_exit >= sl:
+                        status, exit_price = "LOSS", sl
+                        pnl = round(entry - sl, 2)
+                    else:
+                        status = "PROFIT" if rr >= 1.5 else "LOSS"
+                        exit_price = round(sim_exit, 2)
+                        pnl = round(entry - sim_exit, 2)
+
+            pnl_pct = round(pnl / entry * 100, 2) if entry else 0.0
+            exit_time = now.strftime("%H:%M:%S")
 
     trade = {
         "id": trade_id,
@@ -98,15 +129,15 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
         "signal": signal.signal,
         "option": f"NIFTY {int(atm)} {option_type}",
         "entry_spot": round(spot_price, 2),
-        "entry": round(float(signal.entry), 2),
-        "stop_loss": round(float(signal.stop_loss), 2),
-        "target": round(float(signal.target), 2),
-        "rr": signal.risk_reward,
+        "entry": entry,
+        "stop_loss": sl,
+        "target": target,
+        "rr": round(rr, 2),
         "status": status,
-        "exit_price": exit_price,
+        "exit_price": round(float(exit_price), 2) if exit_price is not None else None,
         "exit_time": exit_time,
-        "pnl": pnl,
-        "pnl_pct": pnl_pct,
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct, 2),
         "source": "SIM" if simulated else source,
         "confidence": getattr(signal, "confidence", "MEDIUM"),
     }

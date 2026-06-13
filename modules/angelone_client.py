@@ -297,9 +297,13 @@ def _load_nifty_master_raw() -> pd.DataFrame:
     """
     import requests
 
-    resp = requests.get(_SCRIP_MASTER_URL, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.get(_SCRIP_MASTER_URL, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error(f"Scrip master download failed: {e}")
+        return pd.DataFrame()
 
     rows = []
     for item in data:
@@ -402,8 +406,26 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
             try:
                 md = obj.getMarketData("FULL", {"NFO": batch})
                 if md and md.get("status") and md.get("data"):
-                    for item in md["data"].get("fetched", []):
-                        md_by_token[str(item.get("symbolToken"))] = item
+                    data_payload = md["data"]
+                    # API may return a dict {"fetched": [...]} or a list directly
+                    if isinstance(data_payload, dict):
+                        fetched = data_payload.get("fetched") or []
+                    elif isinstance(data_payload, list):
+                        fetched = data_payload
+                    else:
+                        fetched = []
+                    for item in fetched:
+                        if not isinstance(item, dict):
+                            continue
+                        # Handle both camelCase and lowercase key variants
+                        tok = str(
+                            item.get("symbolToken")
+                            or item.get("symboltoken")
+                            or item.get("token")
+                            or ""
+                        )
+                        if tok:
+                            md_by_token[tok] = item
             except Exception as e:
                 logger.error(f"getMarketData error: {e}")
 
@@ -460,6 +482,10 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
         df = pd.DataFrame(rows)
         df.sort_values("strike", inplace=True)
         df.reset_index(drop=True, inplace=True)
+        if not df.empty:
+            # Persist for fallback when market is closed / chain temporarily unavailable
+            st.session_state["_last_options_df"] = df
+            st.session_state["_last_options_expiry"] = expiry_str
         return df
 
     except Exception as e:

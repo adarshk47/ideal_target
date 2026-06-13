@@ -129,16 +129,38 @@ def filter_to_latest_day(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def style_cells(styler, func, subset):
-    """
-    Apply a cell-wise style, compatible across pandas versions.
-    pandas >= 2.1 uses Styler.map; older versions use Styler.applymap.
-    """
+    """Apply a cell-wise style, compatible across pandas versions."""
     if hasattr(styler, "map"):
         try:
             return styler.map(func, subset=subset)
         except TypeError:
             pass
     return styler.applymap(func, subset=subset)
+
+
+def _scan_exit(candle_df: pd.DataFrame, entry_idx: int, signal_type: str,
+               sl: float, target: float):
+    """Scan candles forward from entry_idx to find when spot hits SL or target.
+
+    Returns (exit_time_str | None, status_str) based on actual candle data.
+    """
+    if candle_df is None or candle_df.empty or entry_idx < 0:
+        return None, "OPEN"
+    for i in range(entry_idx + 1, len(candle_df)):
+        row = candle_df.iloc[i]
+        ts_str = pd.Timestamp(candle_df["timestamp"].iloc[i]).strftime("%H:%M:%S")
+        if signal_type == "BUY":
+            if float(row["low"]) <= sl:
+                return ts_str, "LOSS"
+            if float(row["high"]) >= target:
+                return ts_str, "PROFIT"
+        else:
+            if float(row["high"]) >= sl:
+                return ts_str, "LOSS"
+            if float(row["low"]) <= target:
+                return ts_str, "PROFIT"
+    # SL/Target not hit during session
+    return None, "OPEN"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -546,9 +568,9 @@ def render_recommendations_tab(patterns, spot: float):
             &nbsp;<span class="{badge_cls}">{conf}</span>
             &nbsp;&nbsp;<span style="color:#888;font-size:12px;">{rec['time']}</span><br>
             <span style="font-size:12px;color:#aaa;">
-                Entry: <b style="color:#fff;">{rec['entry']}</b> &nbsp;
-                SL: <b style="color:#ff8888;">{rec['sl']}</b> &nbsp;
-                Target: <b style="color:#88ff88;">{rec['target']}</b> &nbsp;
+                Entry: <b style="color:#fff;">{float(rec['entry']):.2f}</b> &nbsp;
+                SL: <b style="color:#ff8888;">{float(rec['sl']):.2f}</b> &nbsp;
+                Target: <b style="color:#88ff88;">{float(rec['target']):.2f}</b> &nbsp;
                 R:R <b style="color:#ffd700;">1:{rec['rr']}</b>
             </span><br>
             <span style="font-size:11px;color:#666;">{rec.get('description','')}</span>
@@ -594,7 +616,7 @@ def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_
         st.info("Loading strike data...")
 
 
-def render_paper_trade_tab(patterns, spot: float):
+def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=None):
     st.markdown("### 📝 Paper Trading – Auto Signals")
     market_open = is_market_open()
     effective_spot = spot if spot and spot > 0 else st.session_state.get("_last_ltp", 22000.0)
@@ -603,16 +625,41 @@ def render_paper_trade_tab(patterns, spot: float):
         st.warning("🔴 Market Closed — showing **simulation** results based on chart patterns "
                    "detected from last session data.")
 
-    # Auto-add trades from patterns
-    # Live mode: OPEN trades tracked in real-time
-    # Closed mode: simulate all chart-recommended signals immediately
+    # Auto-add trades from patterns.
+    # Live mode: OPEN trades tracked in real-time via update_paper_trades().
+    # Closed mode: resolve immediately using candle-scan exit + option premium entry.
     if patterns:
         for pat in patterns:
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
             sim = not market_open
             if should_add_new_trade(pat_name, pat.signal, simulated=sim):
+                # Look up option premium at ATM strike
+                option_ltp = 0.0
+                if options_df is not None and not options_df.empty:
+                    atm_f = float(round(effective_spot / 50) * 50)
+                    opt_col = "ce_ltp" if pat.signal == "BUY" else "pe_ltp"
+                    try:
+                        closest_idx = (options_df["strike"] - atm_f).abs().argsort().iloc[0]
+                        val = options_df.iloc[closest_idx].get(opt_col, 0.0)
+                        option_ltp = float(val) if val else 0.0
+                    except Exception:
+                        pass
+
+                # For simulation: determine exit outcome from candle data
+                exit_info = None
+                if sim and candle_df is not None and not candle_df.empty:
+                    entry_idx = getattr(pat, "index", getattr(pat, "bar_index", -1))
+                    exit_ts, exit_status = _scan_exit(
+                        candle_df, entry_idx, pat.signal,
+                        float(pat.stop_loss), float(pat.target),
+                    )
+                    if exit_status in ("PROFIT", "LOSS"):
+                        exit_info = {"status": exit_status, "exit_time": exit_ts}
+                    # "OPEN" → exit_info stays None → falls through to R:R sim
+
                 add_paper_trade(pat, pat_name, effective_spot,
-                                source="AUTO", simulated=sim)
+                                source="AUTO", simulated=sim,
+                                option_ltp=option_ltp, exit_info=exit_info)
 
     # Update open trade statuses
     update_paper_trades(spot)
@@ -648,13 +695,15 @@ def render_paper_trade_tab(patterns, spot: float):
             st_color, st_icon = "#ff4444", "🛑 SL HIT"
         else:
             st_color, st_icon = "#aaaaff", "⏳ OPEN"
-        exit_info = ""
+        exit_card = ""
         if trade["exit_price"] is not None:
-            exit_info = (f"Exit: <b style='color:#fff;'>{trade['exit_price']}</b> "
-                         f"@ {trade['exit_time']} &nbsp;|&nbsp; "
+            exit_card = (f"Exit: <b style='color:#fff;'>{float(trade['exit_price']):.2f}</b> "
+                         f"@ {trade['exit_time'] or '—'} &nbsp;|&nbsp; "
                          f"P&L: <b style='color:{st_color};'>{trade['pnl']:+.2f} "
                          f"({trade['pnl_pct']:+.2f}%)</b>")
         src_badge = "SIM" if trade.get("source") == "SIM" else "LIVE"
+        entry_note = " <span style='color:#888;font-size:10px;'>(premium)</span>" \
+            if trade.get("source") == "SIM" and trade.get("entry_spot", 0) != trade.get("entry", 0) else ""
         st.markdown(f"""
         <div style="background:#1e2130;border-left:4px solid {st_color};
                     padding:10px 14px;border-radius:0 6px 6px 0;margin-bottom:8px;">
@@ -668,14 +717,15 @@ def render_paper_trade_tab(patterns, spot: float):
                 Pattern: <b style="color:#ddd;">{trade['pattern']}</b>
                 &nbsp;({trade.get('confidence','')}) &nbsp;|&nbsp;
                 {trade['time']} {trade['date']}
+                &nbsp;|&nbsp; Spot: {float(trade.get('entry_spot', 0)):.2f}
             </div>
             <div style="font-size:13px;color:#ccc;margin-top:6px;">
-                Entry: <b style="color:#fff;">{trade['entry']}</b> &nbsp;|&nbsp;
-                SL: <b style="color:#ff8888;">{trade['stop_loss']}</b> &nbsp;|&nbsp;
-                Target: <b style="color:#88ff88;">{trade['target']}</b> &nbsp;|&nbsp;
+                Entry:{entry_note} <b style="color:#fff;">{float(trade['entry']):.2f}</b> &nbsp;|&nbsp;
+                SL: <b style="color:#ff8888;">{float(trade['stop_loss']):.2f}</b> &nbsp;|&nbsp;
+                Target: <b style="color:#88ff88;">{float(trade['target']):.2f}</b> &nbsp;|&nbsp;
                 R:R <b style="color:#ffd700;">1:{trade['rr']}</b>
             </div>
-            <div style="font-size:13px;color:#ccc;margin-top:4px;">{exit_info}</div>
+            <div style="font-size:13px;color:#ccc;margin-top:4px;">{exit_card}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -908,8 +958,8 @@ def render_best_trade_tab(patterns, options_df: pd.DataFrame, spot: float, oi_de
                         border-radius:0 6px 6px 0;margin-bottom:6px;">
                 <span style="color:{sc};font-weight:bold;">{pat.signal}</span> · {pn}
                 &nbsp;&nbsp;<span style="color:#888;font-size:12px;">Score: {score:.2f}</span>
-                &nbsp;|&nbsp;Entry: {pat.entry} &nbsp;|&nbsp;SL: {pat.stop_loss}
-                &nbsp;|&nbsp;T: {pat.target} &nbsp;|&nbsp;R:R 1:{pat.risk_reward}
+                &nbsp;|&nbsp;Entry: {float(pat.entry):.2f} &nbsp;|&nbsp;SL: {float(pat.stop_loss):.2f}
+                &nbsp;|&nbsp;T: {float(pat.target):.2f} &nbsp;|&nbsp;R:R 1:{pat.risk_reward}
             </div>""", unsafe_allow_html=True)
 
 
@@ -987,10 +1037,14 @@ def main():
     for tf in [1, 2, 5, 10, 15, 30, 60]:
         candle_data_by_tf[tf] = fetch_candle_data(tf, 80)
 
-    # Fetch options chain
+    # Fetch options chain; fall back to last cached result if unavailable
     expiry_dt = get_next_weekly_expiry()
     expiry_str = get_expiry_string(expiry_dt)
     options_df = fetch_options_chain(expiry_str)
+    if options_df is None or options_df.empty:
+        cached_opts = st.session_state.get("_last_options_df")
+        if cached_opts is not None and not cached_opts.empty:
+            options_df = cached_opts
 
     # Detect patterns
     patterns = []
@@ -1044,7 +1098,7 @@ def main():
         render_strike_volume_tab(options_df, ltp, candle_data_by_tf)
 
     with tab3:
-        render_paper_trade_tab(patterns, ltp)
+        render_paper_trade_tab(patterns, ltp, options_df=options_df, candle_df=candle_df)
 
     with tab4:
         render_oi_table_tab(candle_data_by_tf, options_df, ltp)

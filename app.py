@@ -410,8 +410,8 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
         if idx not in best_per_bar or score > best_per_bar[idx][0]:
             best_per_bar[idx] = (score, pat)
 
-    # Most recent 10 bars with a pattern (sorted by bar index)
-    selected = sorted(best_per_bar.items())[-10:]
+    # Most recent 5 bars with a pattern (sorted by bar index) — keeps chart readable
+    selected = sorted(best_per_bar.items())[-5:]
 
     buy_x, buy_y, buy_text = [], [], []
     sell_x, sell_y, sell_text = [], [], []
@@ -527,21 +527,20 @@ def render_recommendations_tab(patterns, spot: float):
     market_open = is_market_open()
 
     if not market_open:
-        st.warning("⚠️ Market is closed. Showing the recommendations captured from the "
-                   "last session — these are frozen and will not change on refresh.")
+        st.info("🔴 Market closed — showing last captured session recommendations.")
 
-    # Seed recommendations from detected patterns.
-    # Key is pattern+signal only (NOT entry price), so a recommendation is
-    # recorded ONCE and then frozen — refreshes won't churn or overwrite it.
-    # We seed in both live and closed states so the last session's best
-    # recommendation persists when the market is shut.
-    if patterns:
+    # Only add new recommendations when market is open (prevents stale spam).
+    # Key includes entry price so the same pattern at a materially different
+    # level adds a new entry rather than silently overwriting the old one.
+    if market_open and patterns:
         existing_keys = {r.get("key") for r in st.session_state["recommendation_history"]}
         for pat in patterns:
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
-            ts_key = f"{pat_name}_{pat.signal}"
+            # Round entry to nearest 10 so small float fluctuations don't churn
+            entry_bucket = int(round(float(pat.entry) / 10) * 10)
+            ts_key = f"{pat_name}_{pat.signal}_{entry_bucket}"
             if ts_key in existing_keys:
-                continue  # already captured — keep the original, do not update
+                continue
             confidence = getattr(pat, "confidence", 0.5)
             if isinstance(confidence, (int, float)):
                 conf_str = "HIGH" if confidence > 0.7 else "MEDIUM" if confidence > 0.4 else "LOW"
@@ -559,7 +558,6 @@ def render_recommendations_tab(patterns, spot: float):
                 "confidence": conf_str,
                 "description": getattr(pat, "description", ""),
             })
-            existing_keys.add(ts_key)
 
     if not st.session_state["recommendation_history"]:
         st.info("No patterns detected yet. Waiting for market data...")

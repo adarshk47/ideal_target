@@ -196,7 +196,15 @@ def get_next_weekly_expiry() -> datetime:
         if cached_date >= today:
             return cached
 
-    # No data available — return None so UI can show "---"
+    # Last resort: calculate next Thursday mathematically (no holiday adjustment)
+    try:
+        next_thu = _calc_next_thursday()
+        expiry_dt = datetime.combine(next_thu, datetime.min.time()).replace(tzinfo=IST)
+        return expiry_dt
+    except Exception:
+        pass
+
+    # Truly no data available
     return None
 
 
@@ -282,23 +290,23 @@ def fetch_candle_data(interval_minutes: int = 1, lookback_bars: int = 200) -> pd
         return _EMPTY_CANDLES.copy()
 
 
-_SCRIP_MASTER_URL = (
-    "https://margincalculator.angelbroking.com/OpenAPI_File/files/"
-    "OpenAPISymbolMaster.json"
-)
+# Scrip master URLs to try in order (AngelOne rebranded from angelbroking.com → angelone.in)
+_SCRIP_MASTER_URLS = [
+    "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPISymbolMaster.json",
+    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPISymbolMaster.json",
+]
 
-# Module-level cache for the scrip master — avoids @st.cache_data so we never
-# accidentally persist an empty/failed result for the full TTL.
-# Falls back to the last successful download on network errors.
+# Module-level cache: only stores successful non-empty results.
+# Falls back to last good copy on network failure — no hour-long blackouts.
 _MASTER_CACHE: dict = {"df": None, "ts": 0.0, "error": "", "stale": None}
 _CHAIN_DIAG: dict = {"msg": ""}   # last options-chain fetch diagnostic
 
 
 def _load_nifty_master_raw() -> pd.DataFrame:
     """
-    Download the NFO scrip master (15-20 MB JSON, ~100k rows) and return
-    all NIFTY OPTIDX rows.  Module-level 1-hour cache; falls back to the
-    last successful copy on download failure so the UI never goes dark.
+    Download the NFO scrip master (~15-20 MB, 100k+ rows) trying each URL in
+    _SCRIP_MASTER_URLS. Caches at module level for 1 hour; falls back to the
+    last successful copy so the UI never goes dark on a transient failure.
     """
     import requests
 
@@ -306,15 +314,21 @@ def _load_nifty_master_raw() -> pd.DataFrame:
     if _MASTER_CACHE["df"] is not None and (now - _MASTER_CACHE["ts"]) < 3600:
         return _MASTER_CACHE["df"]
 
-    try:
-        resp = requests.get(_SCRIP_MASTER_URL, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        _MASTER_CACHE["error"] = (
-            f"Scrip master download failed: {type(e).__name__} — {e}"
-        )
-        logger.error(f"Scrip master download failed: {e}")
+    last_err = ""
+    for url in _SCRIP_MASTER_URLS:
+        try:
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            last_err = ""
+            break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            logger.warning(f"Scrip master URL {url} failed: {e}")
+            data = None
+
+    if data is None:
+        _MASTER_CACHE["error"] = f"Scrip master download failed: {last_err}"
         stale = _MASTER_CACHE["stale"]
         return stale if stale is not None else pd.DataFrame()
 
@@ -352,10 +366,25 @@ def _load_nifty_master_raw() -> pd.DataFrame:
         _MASTER_CACHE["error"] = ""
     else:
         _MASTER_CACHE["error"] = (
-            "Scrip master downloaded but contained no NIFTY OPTIDX rows "
-            "(format may have changed)."
+            "Scrip master downloaded but contained no NIFTY OPTIDX rows."
         )
     return df
+
+
+def _calc_next_thursday() -> "date":
+    """
+    Calculate the next NSE expiry Thursday from today.
+    Used as fallback when the scrip master is unavailable.
+    """
+    from datetime import date as date_type
+    today = datetime.now(IST).date()
+    days_ahead = (3 - today.weekday()) % 7  # 3 = Thursday
+    if days_ahead == 0:
+        # If today IS Thursday, check if market has already closed
+        mkt_close = datetime.now(IST).replace(hour=15, minute=30, second=0)
+        if datetime.now(IST) > mkt_close:
+            days_ahead = 7
+    return today + timedelta(days=days_ahead)
 
 
 def get_options_diagnostic() -> str:

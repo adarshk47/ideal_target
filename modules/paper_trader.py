@@ -80,7 +80,12 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
         if exit_info and exit_info.get("status") in ("PROFIT", "LOSS"):
             status = exit_info["status"]
             exit_time = exit_info.get("exit_time")
-            if status == "PROFIT":
+            # Use B-S-computed option exit price when available (most accurate)
+            exit_opt = exit_info.get("exit_option_price")
+            if exit_opt is not None and use_option and exit_opt > 0:
+                exit_price = exit_opt
+                pnl = round(exit_price - entry, 2)
+            elif status == "PROFIT":
                 exit_price = target
                 pnl = round(target - entry, 2)
             else:

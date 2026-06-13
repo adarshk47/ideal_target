@@ -82,6 +82,7 @@ try:
         get_most_traded_strikes,
     )
     from modules.greeks_analyzer import analyze_greeks, build_greeks_trend_table, get_gamma_exposure
+    from modules.black_scholes import bs_price, time_to_expiry_years, RISK_FREE_RATE as BS_RATE
     from modules.paper_trader import (
         is_market_open as paper_market_open,
         add_paper_trade, update_paper_trades, get_trades_df,
@@ -144,25 +145,25 @@ def _scan_exit(candle_df: pd.DataFrame, entry_idx: int, signal_type: str,
                sl: float, target: float):
     """Scan candles forward from entry_idx to find when spot hits SL or target.
 
-    Returns (exit_time_str | None, status_str) based on actual candle data.
+    Returns (exit_time_str | None, status_str, exit_idx) based on actual candle data.
     """
     if candle_df is None or candle_df.empty or entry_idx < 0:
-        return None, "OPEN"
+        return None, "OPEN", -1
     for i in range(entry_idx + 1, len(candle_df)):
         row = candle_df.iloc[i]
         ts_str = pd.Timestamp(candle_df["timestamp"].iloc[i]).strftime("%H:%M:%S")
         if signal_type == "BUY":
             if float(row["low"]) <= sl:
-                return ts_str, "LOSS"
+                return ts_str, "LOSS", i
             if float(row["high"]) >= target:
-                return ts_str, "PROFIT"
+                return ts_str, "PROFIT", i
         else:
             if float(row["high"]) >= sl:
-                return ts_str, "LOSS"
+                return ts_str, "LOSS", i
             if float(row["low"]) <= target:
-                return ts_str, "PROFIT"
+                return ts_str, "PROFIT", i
     # SL/Target not hit during session
-    return None, "OPEN"
+    return None, "OPEN", -1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -635,15 +636,56 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
     # Auto-add trades from patterns.
     # Live mode: OPEN trades tracked in real-time via update_paper_trades().
     # Closed mode: resolve immediately using candle-scan exit + option premium entry.
+    # ATM strike and IV from options snapshot (used for B-S pricing in simulation)
+    atm_f = float(round(effective_spot / 50) * 50)
+    _atm_ce_iv, _atm_pe_iv = 0.15, 0.15
+    if options_df is not None and not options_df.empty:
+        try:
+            atm_row = options_df[(options_df["strike"] - atm_f).abs() < 26]
+            if not atm_row.empty:
+                _atm_ce_iv = max(float(atm_row.iloc[0].get("ce_iv", 15) or 15) / 100, 0.05)
+                _atm_pe_iv = max(float(atm_row.iloc[0].get("pe_iv", 15) or 15) / 100, 0.05)
+        except Exception:
+            pass
+
+    expiry_dt_for_bs = get_next_weekly_expiry()
+
+    def _bs_option_price(spot_val, opt_type, candle_ts):
+        """Compute B-S option price for ATM strike at a given spot & candle time."""
+        try:
+            ts_dt = pd.Timestamp(candle_ts).to_pydatetime()
+            if ts_dt.tzinfo is None:
+                ts_dt = IST.localize(ts_dt)
+            T = time_to_expiry_years(expiry_dt_for_bs, ts_dt)
+            if T <= 0 or expiry_dt_for_bs is None:
+                return 0.0
+            iv = _atm_ce_iv if opt_type == "C" else _atm_pe_iv
+            price = bs_price(spot_val, atm_f, T, BS_RATE, iv, opt_type)
+            return round(max(price, 0.01), 2)
+        except Exception:
+            return 0.0
+
     if patterns:
         for pat in patterns:
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
             sim = not market_open
             if should_add_new_trade(pat_name, pat.signal, simulated=sim):
-                # Look up option premium at ATM strike
+                opt_type = "C" if pat.signal == "BUY" else "P"
+                entry_idx = getattr(pat, "index", getattr(pat, "bar_index", -1))
+
+                # ── Option entry price: B-S at the pattern candle's spot ──────
                 option_ltp = 0.0
-                if options_df is not None and not options_df.empty:
-                    atm_f = float(round(effective_spot / 50) * 50)
+                entry_time = None
+                if sim and candle_df is not None and not candle_df.empty and 0 <= entry_idx < len(candle_df):
+                    try:
+                        entry_ts = candle_df["timestamp"].iloc[entry_idx]
+                        entry_time = pd.Timestamp(entry_ts).strftime("%H:%M:%S")
+                        spot_at_entry = float(candle_df["close"].iloc[entry_idx])
+                        option_ltp = _bs_option_price(spot_at_entry, opt_type, entry_ts)
+                    except Exception:
+                        pass
+                elif not sim and options_df is not None and not options_df.empty:
+                    # Live: use current ATM LTP snapshot
                     opt_col = "ce_ltp" if pat.signal == "BUY" else "pe_ltp"
                     try:
                         closest_idx = (options_df["strike"] - atm_f).abs().argsort().iloc[0]
@@ -652,26 +694,27 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
                     except Exception:
                         pass
 
-                # For simulation: determine exit outcome from candle data
+                # ── For simulation: scan candles for exit, then B-S exit price ─
                 exit_info = None
-                entry_time = None
                 if sim and candle_df is not None and not candle_df.empty:
-                    entry_idx = getattr(pat, "index", getattr(pat, "bar_index", -1))
-                    # Entry is timed to the pattern candle, not the current
-                    # wall-clock — so entry precedes exit in the trade log.
-                    if 0 <= entry_idx < len(candle_df):
-                        try:
-                            entry_time = pd.Timestamp(
-                                candle_df["timestamp"].iloc[entry_idx]
-                            ).strftime("%H:%M:%S")
-                        except Exception:
-                            entry_time = None
-                    exit_ts, exit_status = _scan_exit(
+                    exit_ts, exit_status, exit_idx = _scan_exit(
                         candle_df, entry_idx, pat.signal,
                         float(pat.stop_loss), float(pat.target),
                     )
                     if exit_status in ("PROFIT", "LOSS"):
-                        exit_info = {"status": exit_status, "exit_time": exit_ts}
+                        exit_option_price = None
+                        if exit_idx >= 0 and option_ltp > 0:
+                            try:
+                                exit_candle_ts = candle_df["timestamp"].iloc[exit_idx]
+                                spot_at_exit = float(candle_df["close"].iloc[exit_idx])
+                                exit_option_price = _bs_option_price(spot_at_exit, opt_type, exit_candle_ts)
+                            except Exception:
+                                pass
+                        exit_info = {
+                            "status": exit_status,
+                            "exit_time": exit_ts,
+                            "exit_option_price": exit_option_price,
+                        }
                     # "OPEN" → exit_info stays None → falls through to R:R sim
 
                 add_paper_trade(pat, pat_name, effective_spot,

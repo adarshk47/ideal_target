@@ -287,29 +287,40 @@ _SCRIP_MASTER_URL = (
     "OpenAPISymbolMaster.json"
 )
 
+# Module-level cache for the scrip master — avoids @st.cache_data so we never
+# accidentally persist an empty/failed result for the full TTL.
+# Falls back to the last successful download on network errors.
+_MASTER_CACHE: dict = {"df": None, "ts": 0.0, "error": "", "stale": None}
+_CHAIN_DIAG: dict = {"msg": ""}   # last options-chain fetch diagnostic
 
-@st.cache_data(ttl=3600)
+
 def _load_nifty_master_raw() -> pd.DataFrame:
     """
-    Download the NFO scrip master once and return ALL NIFTY index options.
-    Columns: strike, option_type (CE/PE), token, symbol, expiry (str),
-    expiry_date (date). Cached for an hour. This is a public file — no auth.
+    Download the NFO scrip master (15-20 MB JSON, ~100k rows) and return
+    all NIFTY OPTIDX rows.  Module-level 1-hour cache; falls back to the
+    last successful copy on download failure so the UI never goes dark.
     """
     import requests
 
+    now = time.time()
+    if _MASTER_CACHE["df"] is not None and (now - _MASTER_CACHE["ts"]) < 3600:
+        return _MASTER_CACHE["df"]
+
     try:
-        resp = requests.get(_SCRIP_MASTER_URL, timeout=20)
+        resp = requests.get(_SCRIP_MASTER_URL, timeout=60)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
+        _MASTER_CACHE["error"] = (
+            f"Scrip master download failed: {type(e).__name__} — {e}"
+        )
         logger.error(f"Scrip master download failed: {e}")
-        return pd.DataFrame()
+        stale = _MASTER_CACHE["stale"]
+        return stale if stale is not None else pd.DataFrame()
 
     rows = []
     for item in data:
-        if item.get("name") != "NIFTY":
-            continue
-        if item.get("instrumenttype") != "OPTIDX":
+        if item.get("name") != "NIFTY" or item.get("instrumenttype") != "OPTIDX":
             continue
         symbol = item.get("symbol", "")
         opt_type = "CE" if symbol.endswith("CE") else "PE" if symbol.endswith("PE") else None
@@ -332,7 +343,28 @@ def _load_nifty_master_raw() -> pd.DataFrame:
             "expiry": exp_raw,
             "expiry_date": exp_date,
         })
-    return pd.DataFrame(rows)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        _MASTER_CACHE["df"] = df
+        _MASTER_CACHE["ts"] = now
+        _MASTER_CACHE["stale"] = df
+        _MASTER_CACHE["error"] = ""
+    else:
+        _MASTER_CACHE["error"] = (
+            "Scrip master downloaded but contained no NIFTY OPTIDX rows "
+            "(format may have changed)."
+        )
+    return df
+
+
+def get_options_diagnostic() -> str:
+    """Return a human-readable reason why options data may be unavailable."""
+    if not is_connected():
+        return "Not connected to AngelOne — click Connect to load live option data."
+    if _MASTER_CACHE["error"]:
+        return _MASTER_CACHE["error"]
+    return _CHAIN_DIAG.get("msg", "")
 
 
 def _load_nifty_expiries() -> list:
@@ -370,9 +402,15 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
     Returns an empty DataFrame if not connected — no simulated data.
     """
     try:
-        if expiry_str is None:
+        _CHAIN_DIAG["msg"] = ""
+        if expiry_str is None or expiry_str == "---":
             expiry_dt = get_next_weekly_expiry()
             expiry_str = get_expiry_string(expiry_dt)
+        if expiry_str == "---":
+            _CHAIN_DIAG["msg"] = (
+                "Expiry unavailable (scrip master not loaded) — cannot map option tokens."
+            )
+            return pd.DataFrame()
 
         obj = get_client()
         if obj is None:
@@ -380,6 +418,9 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
 
         master = _load_nifty_option_master(expiry_str)
         if master.empty:
+            _CHAIN_DIAG["msg"] = (
+                f"No NIFTY option contracts found for expiry {expiry_str} in the scrip master."
+            )
             logger.error(f"No NIFTY options found in master for expiry {expiry_str}")
             return pd.DataFrame()
 
@@ -428,6 +469,12 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
                             md_by_token[tok] = item
             except Exception as e:
                 logger.error(f"getMarketData error: {e}")
+
+        if not md_by_token:
+            _CHAIN_DIAG["msg"] = (
+                "getMarketData returned no rows for the option tokens "
+                "(API limit, session, or NFO subscription)."
+            )
 
         # ── Greeks (delta / gamma / theta / vega / IV) ───────────────────────
         greeks_by_key = {}

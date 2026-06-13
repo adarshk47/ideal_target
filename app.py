@@ -72,6 +72,7 @@ try:
         get_next_weekly_expiry, get_expiry_string, get_expiry_countdown,
         is_market_open, get_atm_strike, get_strike_range, INTERVAL_MAP,
         is_connected, get_data_source, get_client, get_last_error,
+        get_options_diagnostic,
     )
     from modules.pattern_detector import detect_all_patterns
     from modules.oi_analyzer import (
@@ -526,31 +527,39 @@ def render_recommendations_tab(patterns, spot: float):
     market_open = is_market_open()
 
     if not market_open:
-        st.warning("⚠️ Market is closed. No new recommendations. Showing historical data only.")
+        st.warning("⚠️ Market is closed. Showing the recommendations captured from the "
+                   "last session — these are frozen and will not change on refresh.")
 
-    # Add new signals to history
-    if market_open and patterns:
+    # Seed recommendations from detected patterns.
+    # Key is pattern+signal only (NOT entry price), so a recommendation is
+    # recorded ONCE and then frozen — refreshes won't churn or overwrite it.
+    # We seed in both live and closed states so the last session's best
+    # recommendation persists when the market is shut.
+    if patterns:
+        existing_keys = {r.get("key") for r in st.session_state["recommendation_history"]}
         for pat in patterns:
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
-            ts_key = f"{pat_name}_{pat.signal}_{pat.entry}"
-            if ts_key not in [r.get("key") for r in st.session_state["recommendation_history"]]:
-                confidence = getattr(pat, "confidence", 0.5)
-                if isinstance(confidence, (int, float)):
-                    conf_str = "HIGH" if confidence > 0.7 else "MEDIUM" if confidence > 0.4 else "LOW"
-                else:
-                    conf_str = str(confidence)
-                st.session_state["recommendation_history"].append({
-                    "key": ts_key,
-                    "time": datetime.now(IST).strftime("%H:%M:%S"),
-                    "pattern": pat_name,
-                    "signal": pat.signal,
-                    "entry": pat.entry,
-                    "sl": pat.stop_loss,
-                    "target": pat.target,
-                    "rr": pat.risk_reward,
-                    "confidence": conf_str,
-                    "description": getattr(pat, "description", ""),
-                })
+            ts_key = f"{pat_name}_{pat.signal}"
+            if ts_key in existing_keys:
+                continue  # already captured — keep the original, do not update
+            confidence = getattr(pat, "confidence", 0.5)
+            if isinstance(confidence, (int, float)):
+                conf_str = "HIGH" if confidence > 0.7 else "MEDIUM" if confidence > 0.4 else "LOW"
+            else:
+                conf_str = str(confidence)
+            st.session_state["recommendation_history"].append({
+                "key": ts_key,
+                "time": datetime.now(IST).strftime("%H:%M:%S"),
+                "pattern": pat_name,
+                "signal": pat.signal,
+                "entry": round(float(pat.entry), 2),
+                "sl": round(float(pat.stop_loss), 2),
+                "target": round(float(pat.target), 2),
+                "rr": pat.risk_reward,
+                "confidence": conf_str,
+                "description": getattr(pat, "description", ""),
+            })
+            existing_keys.add(ts_key)
 
     if not st.session_state["recommendation_history"]:
         st.info("No patterns detected yet. Waiting for market data...")
@@ -585,7 +594,7 @@ def render_recommendations_tab(patterns, spot: float):
 def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_by_tf: dict):
     st.markdown("### 🎯 Most Traded Strikes – ATM ±5")
     if options_df is None or options_df.empty:
-        st.warning("Options data unavailable")
+        st.warning(f"Options data unavailable — {get_options_diagnostic()}")
         return
 
     tf_col, _ = st.columns([1, 3])
@@ -607,11 +616,16 @@ def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_
                 ATM: <b>{int(atm)}</b>
             </div>""", unsafe_allow_html=True)
 
-        st.dataframe(
-            strike_df,
-            use_container_width=True,
-            hide_index=True,
-        )
+        fmt = {}
+        for c in strike_df.columns:
+            if c in ("CE LTP", "PE LTP", "PCR"):
+                fmt[c] = "{:.2f}"
+            elif c == "Strike":
+                fmt[c] = "{:.0f}"
+            elif c in ("CE OI", "PE OI", "Net OI", "CE Vol", "PE Vol", "Total Vol"):
+                fmt[c] = "{:,.0f}"
+        styled_strike = strike_df.style.format(fmt) if fmt else strike_df.style
+        st.dataframe(styled_strike, use_container_width=True, hide_index=True)
     else:
         st.info("Loading strike data...")
 
@@ -742,10 +756,16 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
         return ""
 
     display_cols = ["id", "time", "pattern", "signal", "option", "entry", "stop_loss",
-                    "target", "rr", "status", "exit_price", "exit_time", "pnl", "confidence"]
+                    "target", "rr", "status", "exit_price", "exit_time", "pnl", "pnl_pct",
+                    "confidence"]
     available = [c for c in display_cols if c in df.columns]
     styled = style_cells(df[available].style, style_status,
                          ["status"] if "status" in available else [])
+    # Force exactly 2 decimals on all price/number columns
+    num_fmt = {c: "{:.2f}" for c in ["entry", "stop_loss", "target", "exit_price",
+                                     "pnl", "pnl_pct", "rr"] if c in available}
+    if num_fmt:
+        styled = styled.format(num_fmt, na_rep="—")
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     if st.button("🗑️ Clear Paper Trades", key="clear_paper"):
@@ -756,7 +776,7 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
 def render_oi_table_tab(candle_data_by_tf: dict, options_df: pd.DataFrame, spot: float):
     st.markdown("### 📊 OI Difference Table – Trend Direction by Timeframe")
     if options_df is None or options_df.empty:
-        st.warning("Options data unavailable")
+        st.warning(f"Options data unavailable — {get_options_diagnostic()}")
         return
 
     oi_table = build_oi_timeframe_table(candle_data_by_tf, options_df, spot)
@@ -801,7 +821,7 @@ def render_oi_table_tab(candle_data_by_tf: dict, options_df: pd.DataFrame, spot:
 def render_greeks_tab(options_df: pd.DataFrame, spot: float):
     st.markdown("### 🔢 Greeks Analysis – Gamma, Theta, Premium Trend")
     if options_df is None or options_df.empty:
-        st.warning("Options data unavailable")
+        st.warning(f"Options data unavailable — {get_options_diagnostic()}")
         return
 
     result = analyze_greeks(options_df, spot, n_strikes=5)
@@ -1013,6 +1033,18 @@ def main():
 
     render_header(ltp, spot_prev, connected)
     render_connect_panel(connected)
+
+    # Show scrip master / expiry diagnostic when data is unavailable
+    if connected:
+        diag = get_options_diagnostic()
+        if diag:
+            with st.expander("⚠️ Options data diagnostic (click to see why expiry/OI tabs show unavailable)", expanded=False):
+                st.warning(diag)
+                if st.button("🔄 Retry loading scrip master", key="retry_scrip"):
+                    from modules.angelone_client import _MASTER_CACHE
+                    _MASTER_CACHE["ts"] = 0.0  # force re-download on next call
+                    st.cache_data.clear()
+                    st.rerun()
 
     # Timeframe selector for chart
     tf_options = {1: "1 min", 2: "2 min", 5: "5 min", 10: "10 min",

@@ -310,6 +310,144 @@ def fetch_candle_data(interval_minutes: int = 1, lookback_bars: int = 200) -> pd
         return _EMPTY_CANDLES.copy()
 
 
+# AngelOne getCandleData max calendar days per request, by interval.
+# (FIVE_MINUTE = 100 days; we chunk conservatively below these caps.)
+_CANDLE_MAX_DAYS = {1: 25, 2: 50, 3: 50, 5: 90, 10: 90, 15: 180, 30: 180, 60: 350}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_candle_range(interval_minutes: int, from_date_str: str,
+                       to_date_str: str) -> pd.DataFrame:
+    """
+    Fetch OHLCV candles for an arbitrary date range, chunked to respect
+    AngelOne's per-request day caps (e.g. 100 days for 5-min). Dates are
+    'YYYY-MM-DD' strings (inclusive). Returns one combined, de-duplicated,
+    time-sorted DataFrame. Empty DataFrame if not connected.
+    """
+    obj = get_client()
+    if obj is None:
+        return _EMPTY_CANDLES.copy()
+
+    try:
+        interval_str = INTERVAL_MAP.get(interval_minutes, "FIVE_MINUTE")
+        start = datetime.strptime(from_date_str, "%Y-%m-%d")
+        end = datetime.strptime(to_date_str, "%Y-%m-%d")
+        if start > end:
+            start, end = end, start
+        max_days = _CANDLE_MAX_DAYS.get(interval_minutes, 90)
+
+        frames = []
+        cur = start
+        while cur <= end:
+            chunk_end = min(cur + timedelta(days=max_days - 1), end)
+            params = {
+                "exchange": NIFTY_EXCHANGE,
+                "symboltoken": NIFTY_TOKEN,
+                "interval": interval_str,
+                "fromdate": cur.strftime("%Y-%m-%d") + " 09:15",
+                "todate": chunk_end.strftime("%Y-%m-%d") + " 15:30",
+            }
+            try:
+                resp = obj.getCandleData(params)
+                if resp and resp.get("status") and resp.get("data"):
+                    chunk = pd.DataFrame(
+                        resp["data"],
+                        columns=["timestamp", "open", "high", "low", "close", "volume"],
+                    )
+                    frames.append(chunk)
+            except Exception as e:
+                logger.warning(f"Candle chunk {cur}–{chunk_end} failed: {e}")
+            cur = chunk_end + timedelta(days=1)
+
+        if not frames:
+            return _EMPTY_CANDLES.copy()
+
+        df = pd.concat(frames, ignore_index=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.dropna(inplace=True)
+        df.drop_duplicates(subset=["timestamp"], inplace=True)
+        df.sort_values("timestamp", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    except Exception as e:
+        logger.error(f"fetch_candle_range error: {e}")
+        return _EMPTY_CANDLES.copy()
+
+
+# ── NSE expiry-day weekday timeline ──────────────────────────────────────────
+# NIFTY index option expiry weekday across history (Mon=0 … Sun=6):
+#   • Since inception (monthly last-Thursday; weekly Thursdays from Feb 2019)
+#     the expiry weekday was THURSDAY (3).
+#   • SEBI circular (26-May-2025) standardised equity-derivative expiries to
+#     Tuesday/Thursday. NSE moved NIFTY expiry to TUESDAY (1) from 01-Sep-2025.
+# To add a future change, append (effective_date, weekday) — kept sorted.
+from datetime import date as _date
+
+_DEFAULT_EXPIRY_WEEKDAY = 3  # Thursday
+_EXPIRY_RULE_TIMELINE = [
+    (_date(2025, 9, 1), 1),  # NSE → Tuesday, effective 1 Sep 2025
+]
+
+
+def expiry_weekday_for(d) -> int:
+    """Return the NSE NIFTY expiry weekday rule in effect on date `d`."""
+    if hasattr(d, "date"):
+        d = d.date()
+    wd = _DEFAULT_EXPIRY_WEEKDAY
+    for eff, w in sorted(_EXPIRY_RULE_TIMELINE):
+        if d >= eff:
+            wd = w
+    return wd
+
+
+def get_expiry_timeline_summary() -> pd.DataFrame:
+    """Human-readable table of when the NIFTY expiry weekday changed."""
+    wd_name = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
+               4: "Friday", 5: "Saturday", 6: "Sunday"}
+    rows = [{
+        "From": "Inception (weekly: 11 Feb 2019)",
+        "To": "31 Aug 2025",
+        "Expiry Day": "Thursday",
+        "Note": "Monthly = last Thursday; weekly Thursdays from Feb 2019",
+    }]
+    prev_to = "Ongoing"
+    for eff, w in sorted(_EXPIRY_RULE_TIMELINE):
+        rows.append({
+            "From": eff.strftime("%d %b %Y"),
+            "To": prev_to,
+            "Expiry Day": wd_name[w],
+            "Note": "SEBI 26-May-2025 circular; NSE→Tuesday to avoid BSE clash",
+        })
+    return pd.DataFrame(rows)
+
+
+def flag_expiry_days(dates: pd.Series) -> pd.Series:
+    """
+    Given a Series of (datetime) trading dates, return a boolean Series marking
+    which are NIFTY expiry days. Within each ISO week the expiry is the latest
+    trading day whose weekday ≤ the rule weekday (handles holiday roll-back),
+    using the weekday rule in effect that week.
+    """
+    s = pd.to_datetime(dates).reset_index(drop=True)
+    flags = pd.Series(False, index=s.index)
+    iso = s.dt.isocalendar()
+    wd = s.dt.weekday
+    grp = pd.DataFrame({"iy": iso["year"].values, "iw": iso["week"].values,
+                        "wd": wd.values, "date": s.values})
+    for (_, _), block in grp.groupby(["iy", "iw"]):
+        rule = expiry_weekday_for(pd.Timestamp(block["date"].iloc[-1]))
+        cand = block[block["wd"] <= rule]
+        if cand.empty:
+            continue
+        # latest trading day with weekday <= rule weekday
+        pick = cand.loc[cand["wd"].idxmax()]
+        flags.loc[pick.name] = True
+    return flags
+
+
 # Scrip master URLs to try in order. The correct filename is
 # OpenAPIScripMaster.json (NOT ...SymbolMaster.json — that 404s).
 _SCRIP_MASTER_URLS = [
@@ -589,7 +727,7 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
     """
     Fetch the NIFTY options chain (ATM ±12 strikes) from AngelOne:
       • getMarketData(FULL) → OI, volume, LTP, best bid/ask per strike
-      • optionGreek         → delta, gamma, theta, vega, IV per strike
+      • Black-Scholes (local) → delta, gamma, theta, vega, IV from each LTP
     Returns one row per strike with ce_*/pe_* columns.
     Returns an empty DataFrame if not connected — no simulated data.
     """
@@ -675,20 +813,6 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
                 "(API limit, session, or NFO subscription)."
             )
 
-        # ── Greeks (delta / gamma / theta / vega / IV) ───────────────────────
-        greeks_by_key = {}
-        try:
-            gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
-            if gr and gr.get("status") and gr.get("data"):
-                for g in gr["data"]:
-                    try:
-                        k = (float(g.get("strikePrice", 0)), g.get("optionType", "").upper())
-                        greeks_by_key[k] = g
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.error(f"optionGreek error: {e}")
-
         def _best_depth(item, side):
             try:
                 lvls = item.get("depth", {}).get(side, [])
@@ -696,7 +820,7 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
             except Exception:
                 return 0.0
 
-        # ── Assemble per-strike rows ─────────────────────────────────────────
+        # ── Assemble per-strike rows (OI / volume / LTP / depth) ─────────────
         strikes = sorted(master["strike"].unique())
         rows = []
         for strike in strikes:
@@ -705,7 +829,6 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
                 ot = opt.upper()
                 sub = master[(master["strike"] == strike) & (master["option_type"] == ot)]
                 md = md_by_token.get(sub["token"].iloc[0]) if not sub.empty else None
-                g = greeks_by_key.get((float(strike), ot), {})
                 if md:
                     row[f"{opt}_oi"] = int(float(md.get("opnInterest", 0) or 0))
                     row[f"{opt}_volume"] = int(float(md.get("tradeVolume", 0) or 0))
@@ -718,16 +841,27 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
                     row[f"{opt}_ltp"] = 0.0
                     row[f"{opt}_bid"] = 0.0
                     row[f"{opt}_ask"] = 0.0
-                row[f"{opt}_iv"] = float(g.get("impliedVolatility", 0) or 0)
-                row[f"{opt}_delta"] = float(g.get("delta", 0) or 0)
-                row[f"{opt}_gamma"] = float(g.get("gamma", 0) or 0)
-                row[f"{opt}_theta"] = float(g.get("theta", 0) or 0)
-                row[f"{opt}_vega"] = float(g.get("vega", 0) or 0)
+                # Greek columns are filled below via Black-Scholes
+                row[f"{opt}_iv"] = 0.0
+                row[f"{opt}_delta"] = 0.0
+                row[f"{opt}_gamma"] = 0.0
+                row[f"{opt}_theta"] = 0.0
+                row[f"{opt}_vega"] = 0.0
             rows.append(row)
 
         df = pd.DataFrame(rows)
         df.sort_values("strike", inplace=True)
         df.reset_index(drop=True, inplace=True)
+
+        # ── Greeks via Black-Scholes (computed locally from option LTP) ──────
+        # More reliable than the optionGreek API, which often returns zeros.
+        try:
+            from modules.black_scholes import compute_chain_greeks
+            expiry_dt = get_next_weekly_expiry()
+            df = compute_chain_greeks(df, spot, expiry_dt, datetime.now(IST))
+        except Exception as e:
+            logger.error(f"Black-Scholes greeks error: {e}")
+
         if not df.empty:
             # Persist for fallback when market is closed / chain temporarily unavailable
             st.session_state["_last_options_df"] = df

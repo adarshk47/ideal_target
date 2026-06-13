@@ -95,12 +95,12 @@ def get_gamma_exposure(options_df: pd.DataFrame, spot_price: float) -> pd.DataFr
     """
     Calculate gamma exposure (GEX) for each strike.
     GEX = gamma * OI * lot_size * spot^2 / 100
-    Nifty lot size = 25
+    Nifty lot size = 75 (current NSE contract size)
     """
     if options_df is None or options_df.empty:
         return pd.DataFrame()
 
-    LOT_SIZE = 25
+    LOT_SIZE = 75
     df = options_df.copy()
     df["ce_gex"] = df["ce_gamma"] * df["ce_oi"] * LOT_SIZE * spot_price**2 / 100
     df["pe_gex"] = -df["pe_gamma"] * df["pe_oi"] * LOT_SIZE * spot_price**2 / 100

@@ -72,7 +72,8 @@ try:
         get_next_weekly_expiry, get_expiry_string, get_expiry_countdown,
         is_market_open, get_atm_strike, get_strike_range, INTERVAL_MAP,
         is_connected, get_data_source, get_client, get_last_error,
-        get_options_diagnostic,
+        get_options_diagnostic, fetch_candle_range, expiry_weekday_for,
+        get_expiry_timeline_summary, flag_expiry_days,
     )
     from modules.pattern_detector import detect_all_patterns
     from modules.oi_analyzer import (
@@ -870,11 +871,215 @@ def render_greeks_tab(options_df: pd.DataFrame, spot: float):
         st.dataframe(gex_df, use_container_width=True, hide_index=True)
 
 
+def _patterns_to_df(patterns) -> pd.DataFrame:
+    """Convert detected pattern objects into an exportable DataFrame."""
+    rows = []
+    for p in patterns:
+        rows.append({
+            "pattern": getattr(p, "pattern", getattr(p, "name", "")),
+            "signal": getattr(p, "signal", ""),
+            "entry": round(float(getattr(p, "entry", 0) or 0), 2),
+            "stop_loss": round(float(getattr(p, "stop_loss", 0) or 0), 2),
+            "target": round(float(getattr(p, "target", 0) or 0), 2),
+            "rr": getattr(p, "risk_reward", ""),
+            "confidence": getattr(p, "confidence", ""),
+            "bar_index": getattr(p, "index", getattr(p, "bar_index", -1)),
+            "description": getattr(p, "description", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def render_intraday_expiry_section(expiry_dt):
+    """
+    Fetch 5-min NIFTY candles for a user date range from AngelOne, detect the
+    expiry days inside it, render each expiry day's intraday chart + detected
+    chart patterns, and let the user export the candle data and the patterns.
+    """
+    st.markdown("#### 🕔 Expiry-Day Intraday (5-min) Chart, Pattern & Export")
+    if not is_connected():
+        st.info("🔌 Connect to AngelOne (top of page) to fetch intraday 5-min history.")
+        return
+
+    today = get_now().date()
+    cda, cdb, cdc, cdd = st.columns([2, 2, 1.5, 1.5])
+    with cda:
+        d_from = st.date_input("From date", value=today - timedelta(days=90),
+                               max_value=today, key="exp_intraday_from")
+    with cdb:
+        d_to = st.date_input("To date", value=today, max_value=today,
+                             key="exp_intraday_to")
+    with cdc:
+        tf_choice = st.selectbox("Interval", [5, 1, 2, 3, 10, 15],
+                                 index=0, key="exp_intraday_tf",
+                                 format_func=lambda x: f"{x} min")
+    with cdd:
+        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+        fetch_clicked = st.button("⬇️ Fetch", type="primary",
+                                  use_container_width=True, key="exp_intraday_fetch")
+
+    if fetch_clicked:
+        with st.spinner(f"Fetching {tf_choice}-min NIFTY {d_from} → {d_to} (chunked)…"):
+            rng_df = fetch_candle_range(tf_choice, d_from.strftime("%Y-%m-%d"),
+                                        d_to.strftime("%Y-%m-%d"))
+        if rng_df is None or rng_df.empty:
+            st.error("No data returned. Check the date range / connection. "
+                     "5-min history is capped at 100 days per request (auto-chunked).")
+        else:
+            st.session_state["intraday_range_df"] = rng_df
+            st.session_state["intraday_range_tf"] = tf_choice
+
+    rng_df = st.session_state.get("intraday_range_df")
+    if rng_df is None or rng_df.empty:
+        return
+
+    tf_used = st.session_state.get("intraday_range_tf", 5)
+    rng_df = rng_df.copy()
+    rng_df["d"] = pd.to_datetime(rng_df["timestamp"]).dt.date
+
+    # Identify expiry days inside the fetched range
+    unique_dates = pd.Series(sorted(rng_df["d"].unique()))
+    udt = pd.to_datetime(unique_dates)
+    exp_flags = flag_expiry_days(udt).values
+    expiry_dates = [d for d, f in zip(unique_dates, exp_flags) if f]
+
+    st.success(f"Loaded **{len(rng_df):,}** {tf_used}-min candles over "
+               f"**{len(unique_dates)}** trading days · "
+               f"**{len(expiry_dates)}** expiry days detected.")
+
+    # Full-range CSV export
+    csv_all = rng_df.drop(columns=["d"]).to_csv(index=False).encode()
+    st.download_button("📥 Export full range (CSV)", csv_all,
+                       file_name=f"nifty_{tf_used}min_{d_from}_{d_to}.csv",
+                       mime="text/csv", key="dl_range_all")
+
+    if not expiry_dates:
+        st.info("No expiry days fall inside this range.")
+        return
+
+    sel = st.selectbox(
+        "Select an expiry day to view its intraday chart & pattern",
+        options=list(reversed(expiry_dates)),
+        format_func=lambda d: f"{d.strftime('%d %b %Y (%a)')}  ·  expiry",
+        key="exp_intraday_day",
+    )
+    day_df = rng_df[rng_df["d"] == sel].drop(columns=["d"]).reset_index(drop=True)
+    if day_df.empty or len(day_df) < 3:
+        st.warning("Not enough candles for the selected expiry day.")
+        return
+
+    # Detect patterns on the expiry day's intraday candles
+    try:
+        day_patterns = detect_all_patterns(day_df)
+    except Exception as e:
+        day_patterns = []
+        st.warning(f"Pattern detection error: {e}")
+
+    # Day OHLC summary
+    o = float(day_df["open"].iloc[0]); c = float(day_df["close"].iloc[-1])
+    h = float(day_df["high"].max()); lo = float(day_df["low"].min())
+    chg = (c - o) / o * 100 if o else 0
+    rng_pct = (h - lo) / o * 100 if o else 0
+    cc = "#00ff88" if chg >= 0 else "#ff4444"
+    s1, s2, s3, s4, s5 = st.columns(5)
+    for col, lbl, vl, sub, clr in [
+        (s1, "Open", f"{o:,.2f}", "", "#fff"),
+        (s2, "Close", f"{c:,.2f}", "", "#fff"),
+        (s3, "Day Move", f"{chg:+.2f}%", "open→close", cc),
+        (s4, "Range", f"{rng_pct:.2f}%", f"{lo:,.0f}–{h:,.0f}", "#ffd700"),
+        (s5, "Patterns", f"{len(day_patterns)}", "detected", "#aaaaff"),
+    ]:
+        with col:
+            st.markdown(f"""<div class="metric-card">
+                <div class="metric-label">{lbl}</div>
+                <div class="metric-value" style="font-size:18px;color:{clr};">{vl}</div>
+                <div class="metric-sub">{sub}</div></div>""", unsafe_allow_html=True)
+
+    # Intraday chart with pattern markers
+    fig_day = build_chart(day_df, day_patterns, [], tf_used)
+    fig_day.update_layout(title=dict(
+        text=f"NIFTY {tf_used}-min — Expiry {sel.strftime('%d %b %Y')}",
+        font=dict(size=14, color="#fff")))
+    st.plotly_chart(fig_day, use_container_width=True,
+                    config={"displaylogo": False})
+
+    # Pattern table + exports
+    pat_df = _patterns_to_df(day_patterns)
+    if not pat_df.empty:
+        st.markdown("**Detected chart patterns on this expiry day:**")
+        st.dataframe(pat_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No high-confidence chart patterns detected on this expiry day.")
+
+    e1, e2 = st.columns(2)
+    with e1:
+        st.download_button(
+            "📥 Export this day's candles (CSV)",
+            day_df.to_csv(index=False).encode(),
+            file_name=f"nifty_{tf_used}min_expiry_{sel}.csv",
+            mime="text/csv", key="dl_day_candles")
+    with e2:
+        if not pat_df.empty:
+            st.download_button(
+                "📥 Export this day's patterns (CSV)",
+                pat_df.to_csv(index=False).encode(),
+                file_name=f"nifty_patterns_expiry_{sel}.csv",
+                mime="text/csv", key="dl_day_patterns")
+
+    # All-expiry-days summary export across the whole fetched range
+    with st.expander("📦 Export ALL expiry days in range (summary + patterns)"):
+        summ_rows, all_pat_rows = [], []
+        for ed in expiry_dates:
+            edf = rng_df[rng_df["d"] == ed].drop(columns=["d"]).reset_index(drop=True)
+            if len(edf) < 3:
+                continue
+            eo = float(edf["open"].iloc[0]); ec = float(edf["close"].iloc[-1])
+            eh = float(edf["high"].max()); el = float(edf["low"].min())
+            try:
+                eps = detect_all_patterns(edf)
+            except Exception:
+                eps = []
+            summ_rows.append({
+                "expiry_date": ed.strftime("%Y-%m-%d"),
+                "weekday": ed.strftime("%a"),
+                "open": round(eo, 2), "high": round(eh, 2),
+                "low": round(el, 2), "close": round(ec, 2),
+                "chg_pct": round((ec - eo) / eo * 100, 2) if eo else 0,
+                "range_pct": round((eh - el) / eo * 100, 2) if eo else 0,
+                "n_patterns": len(eps),
+                "top_pattern": (getattr(eps[0], "pattern",
+                                getattr(eps[0], "name", "")) if eps else ""),
+            })
+            pdf = _patterns_to_df(eps)
+            if not pdf.empty:
+                pdf.insert(0, "expiry_date", ed.strftime("%Y-%m-%d"))
+                all_pat_rows.append(pdf)
+        summ_df = pd.DataFrame(summ_rows)
+        if not summ_df.empty:
+            st.dataframe(summ_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "📥 Export expiry-day summary (CSV)",
+                summ_df.to_csv(index=False).encode(),
+                file_name=f"nifty_expiry_summary_{d_from}_{d_to}.csv",
+                mime="text/csv", key="dl_exp_summary")
+            if all_pat_rows:
+                all_pat = pd.concat(all_pat_rows, ignore_index=True)
+                st.download_button(
+                    "📥 Export ALL expiry-day patterns (CSV)",
+                    all_pat.to_csv(index=False).encode(),
+                    file_name=f"nifty_expiry_patterns_{d_from}_{d_to}.csv",
+                    mime="text/csv", key="dl_exp_all_patterns")
+
+    st.markdown("<hr style='border-color:#2d3250;margin:10px 0;'>", unsafe_allow_html=True)
+
+
 def render_expiry_analysis_tab(wide_candle_df: pd.DataFrame, spot: float, expiry_dt):
     """
-    Historical expiry-day analysis + current expiry prediction.
-    User uploads multi-year daily NIFTY data; we find all past expiry Thursdays,
-    profile them, and find the most similar weeks to predict today's direction.
+    Expiry-day analysis + current expiry prediction.
+    Two parts:
+      1) Live 5-min intraday fetch (date→date) with per-expiry-day chart,
+         pattern detection, and CSV export.
+      2) Upload multi-year daily NIFTY data → profile all past expiry days
+         (Thursday→Tuesday timeline aware) → predict the current expiry.
     """
     st.markdown("### 📅 Expiry Day Analysis & Prediction")
 
@@ -935,19 +1140,32 @@ def render_expiry_analysis_tab(wide_candle_df: pd.DataFrame, spot: float, expiry
             except Exception as e:
                 st.error(f"Error reading CSV: {e}")
 
+    # ── Part 1: live intraday 5-min expiry-day charts + export (no CSV needed)
+    render_intraday_expiry_section(expiry_dt)
+
+    # ── Part 2: multi-year daily analysis & prediction (needs uploaded CSV) ──
+    st.markdown("#### 📚 Multi-Year Historical Expiry Analysis & Prediction")
     hist_df = st.session_state.get("expiry_hist_df")
     if hist_df is None or hist_df.empty:
-        st.info("⬆️ Upload NIFTY historical daily data above to see expiry analysis and predictions.")
+        st.info("⬆️ Upload NIFTY historical daily data above to see the multi-year "
+                "expiry analysis and prediction.")
         return
 
-    # ── Identify expiry days (Thursdays in the dataset) ───────────────────────
+    # ── Expiry-day weekday timeline (when did the expiry day change?) ─────────
+    with st.expander("🗓️ NSE NIFTY Expiry-Day Rule Timeline (when it changed)",
+                     expanded=False):
+        st.dataframe(get_expiry_timeline_summary(), use_container_width=True, hide_index=True)
+        st.caption("Detection below uses Thursday before 01-Sep-2025 and Tuesday after, "
+                   "with automatic roll-back to the previous trading day on holidays.")
+
+    # ── Identify expiry days using the historical weekday rule ────────────────
+    # (Thursday pre-Sep-2025, Tuesday after; holiday-adjusted within each week)
     hist_df = hist_df.copy()
     hist_df["weekday"] = hist_df["date"].dt.weekday
-    # NIFTY weekly options expire on Thursdays (weekday=3)
-    # If a Thursday is missing (holiday), the previous day takes over — approximation
-    exp_days = hist_df[hist_df["weekday"] == 3].copy()
+    exp_mask = flag_expiry_days(hist_df["date"]).values
+    exp_days = hist_df[exp_mask].copy()
     if exp_days.empty:
-        st.warning("No Thursdays found in uploaded data — check date column format.")
+        st.warning("No expiry days detected in uploaded data — check the date column.")
         return
 
     # ── Per-expiry metrics ─────────────────────────────────────────────────────

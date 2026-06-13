@@ -1,6 +1,7 @@
 """
 OI (Open Interest) Analyzer Module
 Calculates Delta OI, net OI trends, and generates directional arrows for chart annotations.
+Provides functions for timeframe-based OI tables and strike volume analysis.
 """
 
 import pandas as pd
@@ -13,9 +14,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
-
 TIMEFRAMES = [1, 2, 5, 10, 15, 30, 60]
 
+
+# ─── OI Snapshot Storage ──────────────────────────────────────────────────────
 
 @st.cache_data(ttl=5)
 def get_oi_snapshot() -> dict:
@@ -63,6 +65,52 @@ def store_oi_snapshot(snapshot: dict):
     ]
 
 
+# ─── Core OI Analysis ─────────────────────────────────────────────────────────
+
+def compute_delta_oi(options_df: pd.DataFrame, spot_price: float) -> dict:
+    """
+    Compute current OI delta/bias from options chain.
+    Returns dict with: bias, pcr, ce_oi, pe_oi, net_oi, delta_net_oi.
+    Used by best-trade tab.
+    """
+    if options_df is None or options_df.empty:
+        return {"bias": "NEUTRAL", "pcr": 1.0, "ce_oi": 0, "pe_oi": 0, "net_oi": 0, "delta_net_oi": 0}
+
+    total_ce = int(options_df["ce_oi"].sum())
+    total_pe = int(options_df["pe_oi"].sum())
+    pcr = total_pe / max(total_ce, 1)
+    net_oi = total_pe - total_ce
+
+    if pcr > 1.25:
+        bias = "BULLISH"   # Contrarian: high PCR = oversold
+    elif pcr < 0.75:
+        bias = "BEARISH"   # Contrarian: low PCR = overbought
+    elif net_oi > 500000:
+        bias = "BEARISH"
+    elif net_oi < -500000:
+        bias = "BULLISH"
+    else:
+        bias = "NEUTRAL"
+
+    # Calculate delta from session OI history
+    history = st.session_state.get("oi_history", [])
+    delta_net_oi = 0
+    if len(history) >= 2:
+        past = history[0]["snapshot"]
+        curr_net = sum(v["pe_oi"] - v["ce_oi"] for v in history[-1]["snapshot"].values())
+        past_net = sum(v["pe_oi"] - v["ce_oi"] for v in past.values())
+        delta_net_oi = curr_net - past_net
+
+    return {
+        "bias": bias,
+        "pcr": round(pcr, 3),
+        "ce_oi": total_ce,
+        "pe_oi": total_pe,
+        "net_oi": net_oi,
+        "delta_net_oi": delta_net_oi,
+    }
+
+
 def get_delta_oi_for_timeframe(minutes: int) -> dict:
     """
     Calculate delta OI (change in net OI) over given timeframe in minutes.
@@ -71,21 +119,18 @@ def get_delta_oi_for_timeframe(minutes: int) -> dict:
     """
     history = st.session_state.get("oi_history", [])
     if len(history) < 2:
-        return _neutral_delta()
+        return _neutral_delta(minutes)
 
     now = datetime.now(IST)
     cutoff = now - timedelta(minutes=minutes)
 
-    # Find closest snapshot to cutoff time
     past_entries = [e for e in history if e["timestamp"] <= cutoff]
     if not past_entries:
-        # Not enough history, use oldest available
         past_entries = [history[0]]
 
     past_snap = past_entries[-1]["snapshot"]
     current_snap = history[-1]["snapshot"]
 
-    # Calculate aggregate changes
     total_ce_oi_change = 0
     total_pe_oi_change = 0
     total_net_oi_change = 0
@@ -102,25 +147,21 @@ def get_delta_oi_for_timeframe(minutes: int) -> dict:
             strikes_analyzed += 1
 
     if strikes_analyzed == 0:
-        return _neutral_delta()
+        return _neutral_delta(minutes)
 
-    # Determine direction
-    # Rising net OI (more PE writing than CE) = BEARISH
-    # Falling net OI (more CE writing than PE) = BULLISH
-    threshold = 50000  # Minimum change to consider significant
-
+    threshold = 50000
     if total_net_oi_change > threshold:
         direction = "BEARISH"
         arrow = "↓"
-        color = "#ef4444"
+        color = "#ff4444"
     elif total_net_oi_change < -threshold:
         direction = "BULLISH"
         arrow = "↑"
-        color = "#22c55e"
+        color = "#00ff88"
     else:
         direction = "NEUTRAL"
         arrow = "→"
-        color = "#f59e0b"
+        color = "#ffd700"
 
     return {
         "direction": direction,
@@ -134,15 +175,15 @@ def get_delta_oi_for_timeframe(minutes: int) -> dict:
     }
 
 
-def _neutral_delta() -> dict:
+def _neutral_delta(minutes: int = 0) -> dict:
     return {
         "direction": "NEUTRAL",
         "arrow": "→",
-        "color": "#f59e0b",
+        "color": "#ffd700",
         "delta_net_oi": 0,
         "ce_oi_change": 0,
         "pe_oi_change": 0,
-        "timeframe_minutes": 0,
+        "timeframe_minutes": minutes,
         "strikes_analyzed": 0,
     }
 
@@ -155,72 +196,157 @@ def get_all_timeframe_deltas() -> dict:
     return results
 
 
-def compute_oi_delta_bars(df_candles: pd.DataFrame, options_df: pd.DataFrame) -> pd.DataFrame:
+# ─── OI Table Builder ─────────────────────────────────────────────────────────
+
+def build_oi_timeframe_table(candle_data_by_tf: dict, options_df: pd.DataFrame, spot: float) -> pd.DataFrame:
     """
-    Build a per-bar OI delta series aligned to the candle timestamps.
-    Used for the OI subplot below the main chart.
+    Build OI difference table showing CE vs PE OI trend for each timeframe.
+    Returns DataFrame with columns: Timeframe, CE OI, PE OI, Net OI, PCR, Trend, Arrow.
     """
-    if df_candles.empty or options_df.empty:
+    if options_df is None or options_df.empty:
         return pd.DataFrame()
 
-    # Aggregate total net OI from options chain (snapshot)
-    total_ce_oi = options_df["ce_oi"].sum()
-    total_pe_oi = options_df["pe_oi"].sum()
-    net_oi = total_pe_oi - total_ce_oi
+    total_ce = int(options_df["ce_oi"].sum())
+    total_pe = int(options_df["pe_oi"].sum())
+    pcr_base = total_pe / max(total_ce, 1)
 
-    # Simulate bar-by-bar OI delta using volume as proxy
-    history = st.session_state.get("oi_history", [])
+    rows = []
+    for tf in TIMEFRAMES:
+        d = get_delta_oi_for_timeframe(tf)
+        ce_chg = d.get("ce_oi_change", 0)
+        pe_chg = d.get("pe_oi_change", 0)
+        net_chg = d.get("delta_net_oi", 0)
+        direction = d.get("direction", "NEUTRAL")
+        arrow = d.get("arrow", "→")
 
-    # Build a time-series of net OI changes aligned to candles
-    timestamps = df_candles["timestamp"].tolist()
-    oi_values = []
+        # Effective OI for this timeframe (snapshot - delta)
+        tf_ce = max(0, total_ce - ce_chg)
+        tf_pe = max(0, total_pe - pe_chg)
+        tf_pcr = round(tf_pe / max(tf_ce, 1), 3)
 
-    np.random.seed(42)
-    # If we have real history, use it; otherwise simulate
-    base_net_oi = net_oi
-    for i, ts in enumerate(timestamps):
-        if history:
-            # Find closest historical snapshot
-            matching = [
-                e for e in history
-                if abs((e["timestamp"].replace(tzinfo=None) - pd.Timestamp(ts).to_pydatetime()).total_seconds()) < 300
-            ]
-            if matching:
-                snap = matching[-1]["snapshot"]
-                bar_net = sum(v["pe_oi"] - v["ce_oi"] for v in snap.values())
-            else:
-                noise = np.random.normal(0, base_net_oi * 0.002)
-                bar_net = base_net_oi + noise * i
-        else:
-            # Mock OI delta: fluctuates around current net
-            noise = np.random.normal(0, abs(base_net_oi) * 0.001 + 10000)
-            bar_net = base_net_oi + noise
+        rows.append({
+            "Timeframe": f"{tf} min",
+            "CE OI": tf_ce,
+            "PE OI": tf_pe,
+            "Net OI Δ": net_chg,
+            "PCR": tf_pcr,
+            "Trend": direction,
+            "Arrow": arrow,
+        })
 
-        oi_values.append(bar_net)
+    return pd.DataFrame(rows)
 
-    oi_df = pd.DataFrame({
-        "timestamp": timestamps,
-        "net_oi": oi_values,
+
+# ─── OI Arrow Annotations for Chart ──────────────────────────────────────────
+
+def get_oi_arrow_annotations(
+    candle_df: pd.DataFrame,
+    options_df: pd.DataFrame,
+    spot: float,
+    selected_tf: int,
+) -> list:
+    """
+    Build Plotly annotation dicts for OI direction arrows to overlay on chart.
+    Returns list of annotation dicts compatible with fig.update_layout(annotations=...).
+    """
+    if candle_df is None or candle_df.empty:
+        return []
+
+    annotations = []
+    last_ts = candle_df["timestamp"].iloc[-1]
+    last_close = float(candle_df["close"].iloc[-1])
+    candle_range = float(candle_df["high"].max() - candle_df["low"].min())
+
+    deltas = get_all_timeframe_deltas()
+    y_start = last_close + candle_range * 0.04
+    y_step = candle_range * 0.03
+
+    for i, tf in enumerate(TIMEFRAMES[:4]):  # Show 4 most recent TFs
+        d = deltas.get(tf, _neutral_delta(tf))
+        arrow = d.get("arrow", "→")
+        color = d.get("color", "#ffd700")
+        direction = d.get("direction", "NEUTRAL")
+
+        annotations.append(dict(
+            x=last_ts,
+            y=y_start + i * y_step,
+            text=f"{tf}m {arrow}",
+            showarrow=False,
+            font=dict(size=11, color=color),
+            xanchor="right",
+            bgcolor="rgba(0,0,0,0.5)",
+            bordercolor=color,
+            borderwidth=1,
+            borderpad=3,
+            xref="x",
+            yref="y",
+        ))
+
+    return annotations
+
+
+# ─── Strike Volume Table ──────────────────────────────────────────────────────
+
+def build_strike_volume_table(
+    options_df: pd.DataFrame,
+    candle_data_by_tf: dict,
+    spot: float,
+    n_strikes: int = 5,
+) -> pd.DataFrame:
+    """
+    Build strike-level volume/OI table for ATM ± n_strikes.
+    Returns formatted DataFrame for display.
+    """
+    from modules.angelone_client import get_strike_range, get_atm_strike
+    if options_df is None or options_df.empty:
+        return pd.DataFrame()
+
+    strike_range = get_strike_range(spot, n_strikes)
+    atm = get_atm_strike(spot)
+    filtered = options_df[options_df["strike"].isin(strike_range)].copy()
+
+    if filtered.empty:
+        return pd.DataFrame()
+
+    filtered["label"] = filtered["strike"].apply(
+        lambda s: "ATM" if s == atm else (f"+{int(s-atm)}" if s > atm else f"{int(s-atm)}")
+    )
+    filtered["total_volume"] = filtered["ce_volume"] + filtered["pe_volume"]
+    filtered["pcr"] = (filtered["pe_oi"] / filtered["ce_oi"].replace(0, 1)).round(3)
+    filtered["net_oi"] = filtered["pe_oi"] - filtered["ce_oi"]
+    filtered = filtered.sort_values("total_volume", ascending=False)
+
+    display = filtered[[
+        "strike", "label", "ce_ltp", "pe_ltp",
+        "ce_oi", "pe_oi", "net_oi",
+        "ce_volume", "pe_volume", "total_volume", "pcr"
+    ]].rename(columns={
+        "strike": "Strike",
+        "label": "Label",
+        "ce_ltp": "CE LTP",
+        "pe_ltp": "PE LTP",
+        "ce_oi": "CE OI",
+        "pe_oi": "PE OI",
+        "net_oi": "Net OI",
+        "ce_volume": "CE Vol",
+        "pe_volume": "PE Vol",
+        "total_volume": "Total Vol",
+        "pcr": "PCR",
     })
 
-    # Calculate bar-by-bar delta
-    oi_df["delta_oi"] = oi_df["net_oi"].diff().fillna(0)
-    oi_df["color"] = oi_df["delta_oi"].apply(
-        lambda x: "#22c55e" if x < 0 else "#ef4444"  # negative delta = bullish
-    )
-    return oi_df
+    return display.reset_index(drop=True)
 
 
-def get_most_traded_strikes(options_df: pd.DataFrame, spot_price: float, n_strikes: int = 5, top_n: int = 10) -> pd.DataFrame:
+def get_most_traded_strikes(options_df: pd.DataFrame, spot: float, n_strikes: int = 5) -> pd.DataFrame:
     """
     Get the most traded strike prices (by volume) within ATM ± n_strikes.
     Returns sorted DataFrame.
     """
     from modules.angelone_client import get_strike_range
-    if options_df.empty:
+    if options_df is None or options_df.empty:
         return pd.DataFrame()
 
-    strike_range = get_strike_range(spot_price, n_strikes)
+    strike_range = get_strike_range(spot, n_strikes)
     filtered = options_df[options_df["strike"].isin(strike_range)].copy()
 
     if filtered.empty:
@@ -234,52 +360,48 @@ def get_most_traded_strikes(options_df: pd.DataFrame, spot_price: float, n_strik
     return filtered.sort_values("total_volume", ascending=False).reset_index(drop=True)
 
 
-def get_oi_table_for_timeframes(options_df: pd.DataFrame, spot_price: float) -> pd.DataFrame:
+def compute_oi_delta_bars(df_candles: pd.DataFrame, options_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build OI difference table showing CE vs PE trend for each timeframe.
-    Returns DataFrame with columns: timeframe, ce_oi_change, pe_oi_change, delta_net_oi, direction, arrow.
+    Build a per-bar OI delta series aligned to the candle timestamps.
+    Used for the OI subplot below the main chart.
     """
-    rows = []
-    deltas = get_all_timeframe_deltas()
+    if df_candles.empty or options_df.empty:
+        return pd.DataFrame()
 
-    for tf in TIMEFRAMES:
-        d = deltas[tf]
-        rows.append({
-            "Timeframe": f"{tf} min",
-            "CE OI Change": d.get("ce_oi_change", 0),
-            "PE OI Change": d.get("pe_oi_change", 0),
-            "Net OI Δ": d.get("delta_net_oi", 0),
-            "Direction": d.get("direction", "NEUTRAL"),
-            "Arrow": d.get("arrow", "→"),
-            "Color": d.get("color", "#f59e0b"),
-        })
+    total_ce_oi = options_df["ce_oi"].sum()
+    total_pe_oi = options_df["pe_oi"].sum()
+    net_oi = total_pe_oi - total_ce_oi
 
-    return pd.DataFrame(rows)
+    history = st.session_state.get("oi_history", [])
+    timestamps = df_candles["timestamp"].tolist()
+    oi_values = []
 
+    np.random.seed(42)
+    base_net_oi = net_oi
+    for i, ts in enumerate(timestamps):
+        if history:
+            matching = [
+                e for e in history
+                if abs((e["timestamp"].replace(tzinfo=None) - pd.Timestamp(ts).to_pydatetime()).total_seconds()) < 300
+            ]
+            if matching:
+                snap = matching[-1]["snapshot"]
+                bar_net = sum(v["pe_oi"] - v["ce_oi"] for v in snap.values())
+            else:
+                noise = np.random.normal(0, abs(base_net_oi) * 0.002 + 10000)
+                bar_net = base_net_oi + noise
+        else:
+            noise = np.random.normal(0, abs(base_net_oi) * 0.001 + 10000)
+            bar_net = base_net_oi + noise
 
-def get_volume_by_timeframe(options_df: pd.DataFrame, spot_price: float, n_strikes: int = 5) -> dict:
-    """
-    Get volume breakdown by timeframe for most traded strikes.
-    Since we don't have historical volume per-bar from the API, we estimate
-    using current snapshot volumes scaled by time proportion.
-    """
-    from modules.angelone_client import get_strike_range
-    strike_range = get_strike_range(spot_price, n_strikes)
-    filtered = options_df[options_df["strike"].isin(strike_range)].copy()
+        oi_values.append(bar_net)
 
-    result = {}
-    for tf in TIMEFRAMES:
-        if filtered.empty:
-            result[tf] = pd.DataFrame()
-            continue
-
-        # Scale volume by timeframe proportion (rough estimate)
-        scale = tf / 375.0  # 375 minutes in trading day
-        tf_df = filtered.copy()
-        tf_df["est_ce_volume"] = (tf_df["ce_volume"] * scale).astype(int)
-        tf_df["est_pe_volume"] = (tf_df["pe_volume"] * scale).astype(int)
-        tf_df["est_total_volume"] = tf_df["est_ce_volume"] + tf_df["est_pe_volume"]
-        tf_df = tf_df.sort_values("est_total_volume", ascending=False)
-        result[tf] = tf_df[["strike", "est_ce_volume", "est_pe_volume", "est_total_volume", "ce_oi", "pe_oi"]].reset_index(drop=True)
-
-    return result
+    oi_df = pd.DataFrame({
+        "timestamp": timestamps,
+        "net_oi": oi_values,
+    })
+    oi_df["delta_oi"] = oi_df["net_oi"].diff().fillna(0)
+    oi_df["color"] = oi_df["delta_oi"].apply(
+        lambda x: "#00ff88" if x < 0 else "#ff4444"
+    )
+    return oi_df

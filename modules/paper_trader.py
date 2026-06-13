@@ -32,16 +32,23 @@ def init_paper_trades():
 def add_paper_trade(signal, pattern_name: str, spot_price: float,
                     source: str = "AUTO", simulated: bool = False,
                     option_ltp: float = 0.0, exit_info: dict = None,
-                    entry_time: str = None):
+                    entry_time: str = None, strike: float = None,
+                    option_sl: float = None, option_target: float = None):
     """Add a new paper trade from a pattern signal.
 
-    option_ltp: if > 1, use as option premium entry price (with 25% risk stop).
-    exit_info:  {'status': 'PROFIT'|'LOSS', 'exit_time': 'HH:MM:SS'|None}
-                from candle-scan; takes priority over R:R simulation.
+    option_ltp: if > 1, use as option premium entry price.
+    option_sl / option_target: option premiums at the spot stop-loss / target
+                levels (B-S priced on the entry-time ATM strike). When given,
+                they replace the fabricated 25%-risk model so the option
+                SL/target reflect the actual price action.
+    exit_info:  {'status': 'PROFIT'|'LOSS', 'exit_time': 'HH:MM:SS'|None,
+                 'exit_option_price': float|None} from candle-scan.
     entry_time: 'HH:MM:SS' of the pattern candle. In simulation the entry must
                 be timed to the candle that triggered the signal — not the
                 current wall-clock time — otherwise entry/exit times are
                 inconsistent (entry would appear after the exit).
+    strike:     explicit ATM strike for the option name; defaults to the strike
+                nearest spot_price.
     """
     init_paper_trades()
     now = datetime.now(IST)
@@ -52,7 +59,7 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
     # otherwise the live wall-clock time.
     trade_time = entry_time if entry_time else now.strftime("%H:%M:%S")
 
-    atm = round(spot_price / 50) * 50
+    atm = int(strike) if strike else round(spot_price / 50) * 50
     option_type = "CE" if signal.signal == "BUY" else "PE"
     rr = float(signal.risk_reward or 1.5)
 
@@ -60,9 +67,15 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
     use_option = bool(option_ltp and option_ltp > 1.0)
     if use_option:
         entry = round(float(option_ltp), 2)
-        risk = round(entry * 0.25, 2)          # 25% of premium as risk
-        sl = round(entry - risk, 2)
-        target = round(entry + risk * rr, 2)
+        if option_sl is not None and option_target is not None:
+            # Option premiums at the spot SL / target — tied to real levels
+            sl = round(float(option_sl), 2)
+            target = round(float(option_target), 2)
+        else:
+            risk = round(entry * 0.25, 2)      # 25% of premium as risk fallback
+            sl = round(entry - risk, 2)
+            target = round(entry + risk * rr, 2)
+        risk = abs(entry - sl)
     else:
         entry = round(float(signal.entry), 2)
         sl = round(float(signal.stop_loss), 2)

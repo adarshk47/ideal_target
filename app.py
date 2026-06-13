@@ -636,12 +636,12 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
     # Auto-add trades from patterns.
     # Live mode: OPEN trades tracked in real-time via update_paper_trades().
     # Closed mode: resolve immediately using candle-scan exit + option premium entry.
-    # ATM strike and IV from options snapshot (used for B-S pricing in simulation)
-    atm_f = float(round(effective_spot / 50) * 50)
+    # ATM IV from the current options snapshot (used as a flat vol for B-S pricing).
+    cur_atm = float(round(effective_spot / 50) * 50)
     _atm_ce_iv, _atm_pe_iv = 0.15, 0.15
     if options_df is not None and not options_df.empty:
         try:
-            atm_row = options_df[(options_df["strike"] - atm_f).abs() < 26]
+            atm_row = options_df[(options_df["strike"] - cur_atm).abs() < 26]
             if not atm_row.empty:
                 _atm_ce_iv = max(float(atm_row.iloc[0].get("ce_iv", 15) or 15) / 100, 0.05)
                 _atm_pe_iv = max(float(atm_row.iloc[0].get("pe_iv", 15) or 15) / 100, 0.05)
@@ -650,8 +650,8 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
 
     expiry_dt_for_bs = get_next_weekly_expiry()
 
-    def _bs_option_price(spot_val, opt_type, candle_ts):
-        """Compute B-S option price for ATM strike at a given spot & candle time."""
+    def _bs_option_price(spot_val, strike, opt_type, candle_ts):
+        """B-S option price for a given strike at a given spot & candle time."""
         try:
             ts_dt = pd.Timestamp(candle_ts).to_pydatetime()
             if ts_dt.tzinfo is None:
@@ -660,7 +660,7 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
             if T <= 0 or expiry_dt_for_bs is None:
                 return 0.0
             iv = _atm_ce_iv if opt_type == "C" else _atm_pe_iv
-            price = bs_price(spot_val, atm_f, T, BS_RATE, iv, opt_type)
+            price = bs_price(spot_val, strike, T, BS_RATE, iv, opt_type)
             return round(max(price, 0.01), 2)
         except Exception:
             return 0.0
@@ -673,22 +673,33 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
                 opt_type = "C" if pat.signal == "BUY" else "P"
                 entry_idx = getattr(pat, "index", getattr(pat, "bar_index", -1))
 
-                # ── Option entry price: B-S at the pattern candle's spot ──────
                 option_ltp = 0.0
+                option_sl = None
+                option_target = None
                 entry_time = None
+                trade_spot = effective_spot      # drives ATM strike & option name
+                trade_strike = cur_atm
+
                 if sim and candle_df is not None and not candle_df.empty and 0 <= entry_idx < len(candle_df):
+                    # ── Strike = ATM at the pattern candle's spot (not today's) ──
                     try:
                         entry_ts = candle_df["timestamp"].iloc[entry_idx]
                         entry_time = pd.Timestamp(entry_ts).strftime("%H:%M:%S")
                         spot_at_entry = float(candle_df["close"].iloc[entry_idx])
-                        option_ltp = _bs_option_price(spot_at_entry, opt_type, entry_ts)
+                        trade_spot = spot_at_entry
+                        trade_strike = float(round(spot_at_entry / 50) * 50)
+                        # Entry/SL/target option premiums, all on the entry-time
+                        # ATM strike, priced at the spot level for each leg.
+                        option_ltp = _bs_option_price(spot_at_entry, trade_strike, opt_type, entry_ts)
+                        option_sl = _bs_option_price(float(pat.stop_loss), trade_strike, opt_type, entry_ts)
+                        option_target = _bs_option_price(float(pat.target), trade_strike, opt_type, entry_ts)
                     except Exception:
                         pass
                 elif not sim and options_df is not None and not options_df.empty:
                     # Live: use current ATM LTP snapshot
                     opt_col = "ce_ltp" if pat.signal == "BUY" else "pe_ltp"
                     try:
-                        closest_idx = (options_df["strike"] - atm_f).abs().argsort().iloc[0]
+                        closest_idx = (options_df["strike"] - cur_atm).abs().argsort().iloc[0]
                         val = options_df.iloc[closest_idx].get(opt_col, 0.0)
                         option_ltp = float(val) if val else 0.0
                     except Exception:
@@ -707,7 +718,8 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
                             try:
                                 exit_candle_ts = candle_df["timestamp"].iloc[exit_idx]
                                 spot_at_exit = float(candle_df["close"].iloc[exit_idx])
-                                exit_option_price = _bs_option_price(spot_at_exit, opt_type, exit_candle_ts)
+                                exit_option_price = _bs_option_price(
+                                    spot_at_exit, trade_strike, opt_type, exit_candle_ts)
                             except Exception:
                                 pass
                         exit_info = {
@@ -717,10 +729,11 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
                         }
                     # "OPEN" → exit_info stays None → falls through to R:R sim
 
-                add_paper_trade(pat, pat_name, effective_spot,
+                add_paper_trade(pat, pat_name, trade_spot,
                                 source="AUTO", simulated=sim,
                                 option_ltp=option_ltp, exit_info=exit_info,
-                                entry_time=entry_time)
+                                entry_time=entry_time, strike=trade_strike,
+                                option_sl=option_sl, option_target=option_target)
 
     # Update open trade statuses
     update_paper_trades(spot)

@@ -876,6 +876,308 @@ def render_greeks_tab(options_df: pd.DataFrame, spot: float):
         st.dataframe(gex_df, use_container_width=True, hide_index=True)
 
 
+def render_expiry_analysis_tab(wide_candle_df: pd.DataFrame, spot: float, expiry_dt):
+    """
+    Historical expiry-day analysis + current expiry prediction.
+    User uploads multi-year daily NIFTY data; we find all past expiry Thursdays,
+    profile them, and find the most similar weeks to predict today's direction.
+    """
+    st.markdown("### 📅 Expiry Day Analysis & Prediction")
+
+    now = get_now()
+    is_expiry_today = (expiry_dt is not None and expiry_dt.date() == now.date())
+    if is_expiry_today:
+        st.success("🎯 **AAJ EXPIRY HAI!** — Real-time similarity analysis active!")
+    elif expiry_dt:
+        st.info(f"Next expiry: **{expiry_dt.strftime('%d %b %Y (%A)')}**")
+
+    # ── Upload ─────────────────────────────────────────────────────────────────
+    with st.expander("📂 Upload Historical NIFTY Daily Data (CSV)",
+                     expanded="expiry_hist_df" not in st.session_state):
+        st.markdown("""
+**Required columns (any order, case-insensitive):** `Date, Open, High, Low, Close`
+- Date formats accepted: `YYYY-MM-DD`, `DD-MM-YYYY`, `DD/MM/YYYY`, `DD-Mon-YYYY`
+- Download from NSE Bhavcopy, Kite export, TradingView, or any broker
+        """)
+        uploaded = st.file_uploader("Choose CSV file", type=["csv"], key="expiry_hist_upload")
+        if uploaded is not None:
+            try:
+                raw = pd.read_csv(uploaded)
+                raw.columns = [c.strip() for c in raw.columns]
+                # Flexible column mapping
+                col_map = {}
+                for c in raw.columns:
+                    lc = c.lower().replace(" ", "").replace("_", "")
+                    if "date" in lc:
+                        col_map[c] = "date"
+                    elif lc.startswith("open"):
+                        col_map[c] = "open"
+                    elif lc.startswith("high"):
+                        col_map[c] = "high"
+                    elif lc.startswith("low"):
+                        col_map[c] = "low"
+                    elif lc.startswith("close") or lc in ("ltp", "lastprice"):
+                        col_map[c] = "close"
+                    elif "vol" in lc:
+                        col_map[c] = "volume"
+                raw = raw.rename(columns=col_map)
+                missing = [r for r in ["date", "open", "high", "low", "close"]
+                           if r not in raw.columns]
+                if missing:
+                    st.error(f"Missing columns: {missing}. Got: {list(raw.columns)}")
+                else:
+                    raw["date"] = pd.to_datetime(raw["date"], dayfirst=True, errors="coerce")
+                    raw.dropna(subset=["date"], inplace=True)
+                    raw.sort_values("date", inplace=True)
+                    for c in ["open", "high", "low", "close"]:
+                        raw[c] = pd.to_numeric(
+                            raw[c].astype(str).str.replace(",", ""), errors="coerce")
+                    raw.dropna(subset=["open", "close"], inplace=True)
+                    raw.reset_index(drop=True, inplace=True)
+                    st.session_state["expiry_hist_df"] = raw
+                    st.success(f"✅ Loaded **{len(raw):,}** rows | "
+                               f"{raw['date'].min().strftime('%d %b %Y')} → "
+                               f"{raw['date'].max().strftime('%d %b %Y')}")
+            except Exception as e:
+                st.error(f"Error reading CSV: {e}")
+
+    hist_df = st.session_state.get("expiry_hist_df")
+    if hist_df is None or hist_df.empty:
+        st.info("⬆️ Upload NIFTY historical daily data above to see expiry analysis and predictions.")
+        return
+
+    # ── Identify expiry days (Thursdays in the dataset) ───────────────────────
+    hist_df = hist_df.copy()
+    hist_df["weekday"] = hist_df["date"].dt.weekday
+    # NIFTY weekly options expire on Thursdays (weekday=3)
+    # If a Thursday is missing (holiday), the previous day takes over — approximation
+    exp_days = hist_df[hist_df["weekday"] == 3].copy()
+    if exp_days.empty:
+        st.warning("No Thursdays found in uploaded data — check date column format.")
+        return
+
+    # ── Per-expiry metrics ─────────────────────────────────────────────────────
+    exp_days["chg_pct"] = ((exp_days["close"] - exp_days["open"])
+                           / exp_days["open"] * 100).round(2)
+    exp_days["range_pct"] = ((exp_days["high"] - exp_days["low"])
+                             / exp_days["open"] * 100).round(2)
+    exp_days["direction"] = exp_days["chg_pct"].apply(
+        lambda x: "BULLISH" if x > 0.1 else "BEARISH" if x < -0.1 else "NEUTRAL")
+
+    # Pre-expiry week: 5-day return into the expiry open
+    pre_rets = []
+    for _, erow in exp_days.iterrows():
+        before = hist_df[hist_df["date"] < erow["date"]].tail(5)
+        if len(before) >= 2:
+            pw = (erow["open"] - float(before.iloc[0]["open"])) / float(before.iloc[0]["open"]) * 100
+        else:
+            pw = 0.0
+        pre_rets.append(round(pw, 2))
+    exp_days["pre_week_ret"] = pre_rets
+    exp_days["pre_week_dir"] = exp_days["pre_week_ret"].apply(
+        lambda x: "UP" if x > 0 else "DOWN")
+
+    # ── Historical summary cards ───────────────────────────────────────────────
+    st.markdown("#### 📊 Historical Expiry Day Summary")
+    total = len(exp_days)
+    bull = (exp_days["direction"] == "BULLISH").sum()
+    bear = (exp_days["direction"] == "BEARISH").sum()
+    neu = total - bull - bear
+    avg_chg = exp_days["chg_pct"].mean()
+    median_chg = exp_days["chg_pct"].median()
+    avg_rng = exp_days["range_pct"].mean()
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    chg_col = "#00ff88" if avg_chg >= 0 else "#ff4444"
+    cards = [
+        ("Expiry Days", f"{total}", f"{exp_days['date'].min().strftime('%b %Y')} – {exp_days['date'].max().strftime('%b %Y')}"),
+        ("Bullish", f"{bull} ({bull/total*100:.0f}%)", "Close > Open", "#00ff88"),
+        ("Bearish", f"{bear} ({bear/total*100:.0f}%)", "Close < Open", "#ff4444"),
+        ("Avg Move", f"{avg_chg:+.2f}%", f"Median {median_chg:+.2f}%", chg_col),
+        ("Avg Range", f"{avg_rng:.2f}%", "High–Low / Open", "#ffd700"),
+    ]
+    for col, (label, val, sub, *color) in zip([c1, c2, c3, c4, c5], cards):
+        vc = color[0] if color else "#fff"
+        with col:
+            st.markdown(f"""<div class="metric-card">
+                <div class="metric-label">{label}</div>
+                <div class="metric-value" style="color:{vc};">{val}</div>
+                <div class="metric-sub">{sub}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── Pre-week direction → expiry outcome table ──────────────────────────────
+    st.markdown("#### 🔁 Pre-Expiry Week Trend → Expiry Day Outcome")
+    for pw in ["UP", "DOWN"]:
+        sub = exp_days[exp_days["pre_week_dir"] == pw]
+        if sub.empty:
+            continue
+        s_bull = (sub["direction"] == "BULLISH").sum()
+        s_bear = (sub["direction"] == "BEARISH").sum()
+        n = len(sub)
+        avg_mv = sub["chg_pct"].mean()
+        bc = "#00ff88" if avg_mv >= 0 else "#ff4444"
+        icon = "📈" if pw == "UP" else "📉"
+        st.markdown(f"""
+        <div style="background:#1e2130;border-radius:8px;padding:8px 14px;margin-bottom:6px;">
+            {icon} <b>Pre-week {pw}</b> ({n} cases) &nbsp;→&nbsp;
+            <span style="color:#00ff88;">Bullish {s_bull/n*100:.0f}%</span> &nbsp;|&nbsp;
+            <span style="color:#ff4444;">Bearish {s_bear/n*100:.0f}%</span> &nbsp;|&nbsp;
+            Avg move: <b style="color:{bc};">{avg_mv:+.2f}%</b>
+        </div>""", unsafe_allow_html=True)
+
+    # ── Visualisation: expiry day moves bar chart ──────────────────────────────
+    st.markdown("#### 📈 Expiry Day Returns (Last 52 weeks)")
+    recent_exp = exp_days.tail(52)
+    bar_colors = ["#00cc66" if v >= 0 else "#cc2222" for v in recent_exp["chg_pct"]]
+    fig_bar = go.Figure(go.Bar(
+        x=recent_exp["date"].dt.strftime("%d%b'%y"),
+        y=recent_exp["chg_pct"],
+        marker_color=bar_colors,
+        text=[f"{v:+.2f}%" for v in recent_exp["chg_pct"]],
+        textposition="outside",
+        textfont_size=9,
+    ))
+    fig_bar.update_layout(
+        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+        font=dict(color="#ccc"), height=300,
+        margin=dict(l=10, r=10, t=20, b=60),
+        yaxis=dict(gridcolor="#1e2130", zeroline=True, zerolinecolor="#555"),
+        xaxis=dict(tickangle=-60, gridcolor="#1e2130"),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    # ── Calculate current pre-week return ─────────────────────────────────────
+    # Prefer hist_df if it has data close to today; else use live candle data
+    today_dt = now.date()
+    recent_hist = hist_df[hist_df["date"].dt.date <= today_dt].tail(6)
+    if len(recent_hist) >= 2 and (today_dt - recent_hist.iloc[-1]["date"].date()).days <= 5:
+        curr_pw_ret = ((recent_hist.iloc[-1]["close"] - recent_hist.iloc[0]["open"])
+                       / recent_hist.iloc[0]["open"] * 100)
+    elif wide_candle_df is not None and not wide_candle_df.empty and spot > 0:
+        w5 = wide_candle_df.head(5)
+        curr_pw_ret = ((spot - float(w5.iloc[0]["open"])) / float(w5.iloc[0]["open"]) * 100
+                       if not w5.empty else 0.0)
+    else:
+        curr_pw_ret = 0.0
+    curr_pw_ret = round(curr_pw_ret, 2)
+    curr_pw_dir = "UP" if curr_pw_ret > 0 else "DOWN"
+
+    # ── Find similar historical expiry weeks ───────────────────────────────────
+    # Similarity metric: same pre-week direction + closest pre-week return magnitude
+    same_dir = exp_days[exp_days["pre_week_dir"] == curr_pw_dir].copy()
+    pool = same_dir if len(same_dir) >= 5 else exp_days.copy()
+    pool["sim_score"] = 1 / (1 + abs(pool["pre_week_ret"] - curr_pw_ret))
+    top8 = pool.nlargest(8, "sim_score")
+
+    pred_bull = (top8["direction"] == "BULLISH").sum()
+    pred_bear = (top8["direction"] == "BEARISH").sum()
+    pred_n = len(top8)
+    pred_avg = top8["chg_pct"].mean()
+    bull_pct = pred_bull / pred_n * 100 if pred_n else 50
+
+    if bull_pct > 60:
+        pred, pred_col, pred_icon = "BULLISH", "#00ff88", "📈"
+        pred_txt = f"{bull_pct:.0f}% of the {pred_n} most similar expiry weeks closed green"
+    elif bull_pct < 40:
+        pred, pred_col, pred_icon = "BEARISH", "#ff4444", "📉"
+        pred_txt = f"{100-bull_pct:.0f}% of the {pred_n} most similar expiry weeks closed red"
+    else:
+        pred, pred_col, pred_icon = "NEUTRAL", "#ffd700", "↔️"
+        pred_txt = f"Mixed signals from {pred_n} similar historical expiry weeks"
+
+    expiry_label = (f"🎯 TODAY'S EXPIRY — {expiry_dt.strftime('%d %b %Y')}"
+                    if is_expiry_today
+                    else f"📅 NEXT EXPIRY — {expiry_dt.strftime('%d %b %Y') if expiry_dt else '---'}")
+
+    st.markdown("#### 🎯 Current Expiry Prediction")
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#15201a,#1e2130);
+                border:2px solid {pred_col};border-radius:12px;
+                padding:20px 24px;margin-bottom:16px;">
+        <div style="font-size:12px;color:#888;margin-bottom:4px;">{expiry_label}</div>
+        <div style="font-size:28px;font-weight:bold;color:{pred_col};">
+            {pred_icon} {pred}
+        </div>
+        <div style="font-size:13px;color:#aaa;margin-top:2px;">{pred_txt}</div>
+        <hr style="border-color:#2d3250;margin:12px 0;">
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;">
+            <div>
+                <div style="color:#888;font-size:11px;">Current pre-week</div>
+                <div style="color:#fff;font-size:18px;font-weight:bold;">{curr_pw_ret:+.2f}%</div>
+                <div style="font-size:11px;color:#888;">{curr_pw_dir}</div>
+            </div>
+            <div>
+                <div style="color:#888;font-size:11px;">Predicted avg move</div>
+                <div style="color:{pred_col};font-size:18px;font-weight:bold;">{pred_avg:+.2f}%</div>
+                <div style="font-size:11px;color:#888;">Open → Close</div>
+            </div>
+            <div>
+                <div style="color:#888;font-size:11px;">Bull / Bear split</div>
+                <div style="font-size:18px;font-weight:bold;">
+                    <span style="color:#00ff88;">{pred_bull}</span>
+                    <span style="color:#888;"> / </span>
+                    <span style="color:#ff4444;">{pred_bear}</span>
+                </div>
+                <div style="font-size:11px;color:#888;">of {pred_n} similar weeks</div>
+            </div>
+            <div>
+                <div style="color:#888;font-size:11px;">Spot price</div>
+                <div style="color:#fff;font-size:18px;font-weight:bold;">{spot:,.2f}</div>
+                <div style="font-size:11px;color:#888;">NIFTY 50</div>
+            </div>
+        </div>
+        <div style="margin-top:12px;font-size:11px;color:#555;">
+            ⚠️ Based on historical pattern similarity only. Not financial advice.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Most similar historical weeks table ───────────────────────────────────
+    st.markdown("#### 🔍 Most Similar Historical Expiry Days")
+    disp = top8[["date", "open", "high", "low", "close", "chg_pct",
+                 "range_pct", "direction", "pre_week_ret"]].copy()
+    disp["date"] = disp["date"].dt.strftime("%d %b %Y")
+    disp = disp.rename(columns={
+        "date": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close",
+        "chg_pct": "Chg %", "range_pct": "Range %",
+        "direction": "Direction", "pre_week_ret": "Pre-week %",
+    })
+    num_fmt = {c: "{:.2f}" for c in ["Open", "High", "Low", "Close",
+                                      "Chg %", "Range %", "Pre-week %"]}
+
+    def style_dir_exp(val):
+        if val == "BULLISH":
+            return "background:#1a3a1a;color:#00ff88;font-weight:bold"
+        if val == "BEARISH":
+            return "background:#3a1a1a;color:#ff4444;font-weight:bold"
+        return "color:#ffd700"
+
+    styled_disp = style_cells(disp.style.format(num_fmt), style_dir_exp, ["Direction"])
+    st.dataframe(styled_disp, use_container_width=True, hide_index=True)
+
+    # ── Full history (collapsible) ─────────────────────────────────────────────
+    with st.expander(f"📋 Full Expiry Day History ({total} days)"):
+        all_disp = exp_days[["date", "open", "close", "chg_pct",
+                              "range_pct", "direction", "pre_week_ret"]].copy()
+        all_disp["date"] = all_disp["date"].dt.strftime("%d %b %Y")
+        all_disp = all_disp.rename(columns={
+            "date": "Date", "open": "Open", "close": "Close",
+            "chg_pct": "Chg %", "range_pct": "Range %",
+            "direction": "Direction", "pre_week_ret": "Pre-week %",
+        })
+        fmt2 = {c: "{:.2f}" for c in ["Open", "Close", "Chg %", "Range %", "Pre-week %"]}
+        st2 = style_cells(
+            all_disp.sort_values("Date", ascending=False).style.format(fmt2),
+            style_dir_exp, ["Direction"],
+        )
+        st.dataframe(st2, use_container_width=True, hide_index=True)
+
+    if st.button("🗑️ Clear uploaded data", key="clear_hist_data"):
+        st.session_state.pop("expiry_hist_df", None)
+        st.rerun()
+
+
 def render_best_trade_tab(patterns, options_df: pd.DataFrame, spot: float, oi_delta: dict, greeks: dict):
     st.markdown("### 🏆 Best Trade Recommendation")
     market_open = is_market_open()
@@ -1058,9 +1360,9 @@ def main():
             key="chart_tf_radio",
         )
 
-    # Fetch candle data for selected TF, then keep only the latest trading day
-    candle_df = fetch_candle_data(selected_tf, 200)
-    candle_df = filter_to_latest_day(candle_df)
+    # Fetch candle data for selected TF; keep both the full window and last-day view
+    candle_df_wide = fetch_candle_data(selected_tf, 200)   # 6-day window, for pre-week calc
+    candle_df = filter_to_latest_day(candle_df_wide)       # today/last-day only, for chart
 
     # Fetch data for all timeframes (for OI table)
     candle_data_by_tf = {}
@@ -1112,13 +1414,14 @@ def main():
         })
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📋 Recommendations",
         "🎯 Strike Volume",
         "📝 Paper Trade",
         "📊 OI Table",
         "🔢 Greeks",
         "🏆 Best Trade",
+        "📅 Expiry Analysis",
     ])
 
     with tab1:
@@ -1138,6 +1441,9 @@ def main():
 
     with tab6:
         render_best_trade_tab(patterns, options_df, ltp, oi_delta, greeks_result)
+
+    with tab7:
+        render_expiry_analysis_tab(candle_df_wide, ltp, expiry_dt)
 
     # ── Auto-refresh bar at bottom ─────────────────────────────────────────
     st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)

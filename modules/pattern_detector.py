@@ -993,6 +993,102 @@ def detect_rsi_reversal(df: pd.DataFrame, rsi: np.ndarray, atr: np.ndarray,
     return signals
 
 
+def detect_range_breakout(df: pd.DataFrame, atr: np.ndarray,
+                            vwap: np.ndarray, look: int = 8) -> List[PatternSignal]:
+    """
+    Range / Consolidation Breakout (Darvas Box, Bollinger squeeze concept).
+
+    Big traders accumulate inside a tight range, then a wide-range expansion
+    candle breaks out on volume. We catch THAT breakout candle — the single
+    most important bar — instead of chasing the move later near the top.
+
+    Conditions:
+      • prior `look` bars form a tight box (range ≤ 2.5×ATR)  → consolidation
+      • current candle closes above the box high               → breakout
+      • current candle is green with range ≥ 1.1×ATR           → expansion
+    """
+    signals = []
+    if len(df) < look + 3:
+        return signals
+    opens  = df["open"].values
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    for i in range(look + 2, len(df)):
+        if np.isnan(atr[i]) or atr[i] <= 0:
+            continue
+        atr_v = atr[i]
+        box_high = float(highs[i - look:i].max())
+        box_low  = float(lows[i - look:i].min())
+        box_range = box_high - box_low
+        if box_range <= 0 or box_range > 2.5 * atr_v:
+            continue   # not a tight consolidation
+        cur_range = highs[i] - lows[i]
+        # Breakout candle: closes above box on an expansion green bar
+        if (closes[i] > box_high and closes[i] > opens[i]
+                and cur_range >= 1.1 * atr_v):
+            entry  = round(closes[i] + 0.5, 2)
+            # Structural stop just back inside the box / below breakout bar
+            sl     = round(min(lows[i], box_high) - 0.3 * atr_v, 2)
+            risk   = entry - sl
+            target = round(entry + 1.6 * risk, 2)
+            signals.append(PatternSignal(
+                pattern="Range Breakout (Bullish)", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.80, description=f"Box breakout above {box_high:.0f} on expansion candle",
+            ))
+    return signals
+
+
+def detect_ema_pullback(df: pd.DataFrame, ema9: np.ndarray, ema21: np.ndarray,
+                          vwap: np.ndarray, atr: np.ndarray) -> List[PatternSignal]:
+    """
+    EMA Pullback Continuation – Al Brooks "High-2" / trend-pullback entry.
+
+    The highest-probability trend entry is NOT the breakout but the first
+    pullback to the rising EMA inside an established uptrend. We buy the
+    resumption bar (price dipped to EMA9, then closed back up making a higher
+    bar) so we ride the trend without chasing the top.
+
+    Conditions:
+      • EMA9 > EMA21 and price above VWAP        → confirmed uptrend
+      • previous bar's low tagged the EMA9 zone  → healthy pullback
+      • current bar closes green above prev high → resumption
+    """
+    signals = []
+    opens  = df["open"].values
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    for i in range(23, len(df)):
+        if (np.isnan(ema9[i]) or np.isnan(ema21[i]) or np.isnan(atr[i])
+                or atr[i] <= 0 or np.isnan(ema9[i - 1])):
+            continue
+        atr_v = atr[i]
+        # Established uptrend with VWAP support
+        uptrend = ema9[i] > ema21[i] and (np.isnan(vwap[i]) or closes[i] > vwap[i])
+        if not uptrend:
+            continue
+        # Previous bar pulled back to the EMA9 zone (low near EMA9)
+        pulled_back = (lows[i - 1] <= ema9[i - 1] + 0.4 * atr_v
+                       and lows[i - 1] >= ema21[i - 1] - 0.6 * atr_v)
+        # Current bar resumes: green and closes above previous high (higher bar)
+        resumed = closes[i] > opens[i] and closes[i] > highs[i - 1]
+        if pulled_back and resumed:
+            entry  = round(closes[i] + 0.5, 2)
+            sl     = round(min(lows[i], lows[i - 1]) - 0.3 * atr_v, 2)
+            risk   = entry - sl
+            target = round(entry + 1.5 * risk, 2)
+            signals.append(PatternSignal(
+                pattern="EMA Pullback (Bullish)", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.79, description=f"Trend pullback to EMA9 then resumption at {closes[i]:.0f}",
+            ))
+    return signals
+
+
 # ─── Multi-Factor Post-Processor ─────────────────────────────────────────────
 
 def _apply_multi_factor(signals: List[PatternSignal], df: pd.DataFrame,
@@ -1142,6 +1238,8 @@ def detect_all_patterns(df: pd.DataFrame, buy_only: bool = True) -> List[Pattern
         signals += detect_ema_cross(df, ema9, ema21, vwap, atr)
         signals += detect_momentum_breakout(df, vwap, atr)
         signals += detect_rsi_reversal(df, rsi, atr, ema9, ema21)
+        signals += detect_range_breakout(df, atr, vwap)
+        signals += detect_ema_pullback(df, ema9, ema21, vwap, atr)
 
     except Exception as e:
         logger.error(f"Pattern detection error: {e}")

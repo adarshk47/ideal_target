@@ -35,6 +35,7 @@ class PatternSignal:
     confidence: float  # 0-1
     description: str
     color: str = "green"
+    counter_trend: bool = False  # True if signal opposes both VWAP & EMA trend
 
     def __post_init__(self):
         self.color = "green" if self.signal == "BUY" else "red"
@@ -1013,33 +1014,47 @@ def _apply_multi_factor(signals: List[PatternSignal], df: pd.DataFrame,
         if i >= len(df):
             enhanced.append(sig); continue
 
-        # ── ATR-based minimum stop ─────────────────────────────────────────
+        # ── ATR-based risk normalisation ───────────────────────────────────
+        # Scalping wants a STOP wide enough to survive normal noise, paired
+        # with a CLOSE, achievable target (so the hit-rate stays high). We
+        # clamp every signal's risk into a sensible ATR band and set the
+        # target at 1.4× that risk (R:R ≈ 1:1.4).
         if not np.isnan(atr[i]) and atr[i] > 0:
             atr_v = atr[i]
-            min_stop_dist = 0.6 * atr_v
-            current_risk  = abs(sig.entry - sig.stop_loss)
-            if current_risk < min_stop_dist:
-                if sig.signal == "BUY":
-                    sig.stop_loss = round(sig.entry - min_stop_dist, 2)
-                    sig.target    = round(sig.entry + 2.0 * min_stop_dist, 2)
-                else:
-                    sig.stop_loss = round(sig.entry + min_stop_dist, 2)
-                    sig.target    = round(sig.entry - 2.0 * min_stop_dist, 2)
+            current_risk = abs(sig.entry - sig.stop_loss)
+            # Stop floor 1.0×ATR, ceiling 1.8×ATR → "thoda jyada" SL
+            risk = min(max(current_risk, 1.0 * atr_v), 1.8 * atr_v)
+            if sig.signal == "BUY":
+                sig.stop_loss = round(sig.entry - risk, 2)
+                sig.target    = round(sig.entry + 1.4 * risk, 2)
+            else:
+                sig.stop_loss = round(sig.entry + risk, 2)
+                sig.target    = round(sig.entry - 1.4 * risk, 2)
 
         # ── Multi-factor scoring ──────────────────────────────────────────
         score = 0
+        vwap_against = False   # price clearly on the wrong side of VWAP
+        ema_against  = False   # EMA trend clearly opposes the signal
 
         # 1. VWAP alignment
         if i < len(vwap) and not np.isnan(vwap[i]):
             if sig.signal == "BUY"  and closes[i] > vwap[i]: score += 1
             elif sig.signal == "SELL" and closes[i] < vwap[i]: score += 1
-            else: score -= 1   # trading against VWAP
+            else:
+                score -= 1   # trading against VWAP
+                vwap_against = True
 
         # 2. EMA 9/21 trend direction
         if (i < len(ema9) and i < len(ema21)
                 and not np.isnan(ema9[i]) and not np.isnan(ema21[i])):
             if sig.signal == "BUY"  and ema9[i] > ema21[i]: score += 1
             elif sig.signal == "SELL" and ema9[i] < ema21[i]: score += 1
+            else:
+                ema_against = True
+
+        # Flag hard counter-trend setups (both VWAP and EMA disagree) so the
+        # caller can drop them — these are the lowest-probability scalps.
+        sig.counter_trend = bool(vwap_against and ema_against)
 
         # 3. RSI zone (avoid entering extremes against direction)
         if i < len(rsi) and not np.isnan(rsi[i]):
@@ -1128,8 +1143,11 @@ def detect_all_patterns(df: pd.DataFrame) -> List[PatternSignal]:
     # Apply multi-factor scoring & ATR-based stop widening
     signals = _apply_multi_factor(signals, df, vwap, atr, ema9, ema21, rsi)
 
-    # Quality gates
-    signals = [s for s in signals if s.confidence >= 0.56 and s.risk_reward >= 1.4]
+    # Quality gates: drop low-confidence, poor-R:R, and hard counter-trend setups.
+    # Trading WITH the trend (VWAP + EMA) is the single biggest edge for scalping,
+    # so a signal fighting both is filtered out entirely.
+    signals = [s for s in signals
+               if s.confidence >= 0.58 and s.risk_reward >= 1.2 and not s.counter_trend]
 
     # Deduplicate: best confidence per index
     best: dict[int, PatternSignal] = {}

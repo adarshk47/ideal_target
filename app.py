@@ -85,6 +85,7 @@ try:
     )
     from modules.greeks_analyzer import analyze_greeks, build_greeks_trend_table, get_gamma_exposure
     from modules.black_scholes import bs_price, time_to_expiry_years, RISK_FREE_RATE as BS_RATE
+    from modules.chart_analysis import analyze_trendlines
     from modules.paper_trader import (
         is_market_open as paper_market_open,
         add_paper_trade, update_paper_trades, get_trades_df,
@@ -308,11 +309,12 @@ def _pick_active_signal(selected):
 # ─────────────────────────────────────────────────────────────────────────────
 # CHART
 # ─────────────────────────────────────────────────────────────────────────────
-def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: int):
+def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: int,
+                instrument_label: str = "NIFTY50"):
     if candle_df is None or candle_df.empty:
         fig = go.Figure()
         fig.update_layout(
-            title="No data — connect to AngelOne (add API secrets) to load NIFTY candles",
+            title="No data — connect to AngelOne (add API secrets) to load candles",
             paper_bgcolor="#0e1117",
             plot_bgcolor="#0e1117",
             font_color="#fff",
@@ -336,7 +338,7 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
         high=candle_df["high"],
         low=candle_df["low"],
         close=candle_df["close"],
-        name="NIFTY",
+        name=instrument_label,
         increasing_line_color="#00ff88",
         decreasing_line_color="#ff4444",
         increasing_fillcolor="#00cc66",
@@ -382,7 +384,7 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
                            xanchor="left", font=dict(color="#4dd2a0", size=9),
                            row=1, col=1)
 
-    # Trend line — linear regression over the session (direction + slope)
+    # Overall direction — faint linear-regression guide over the session
     if len(candle_df) >= 3:
         y = candle_df["close"].values.astype(float)
         x_idx = np.arange(len(y))
@@ -392,9 +394,48 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
         fig.add_trace(go.Scatter(
             x=candle_df["timestamp"], y=y_fit, mode="lines",
             line=dict(color="#00ff88" if trend_up else "#ff4444",
-                      width=1.6, dash="dash"),
-            name=f"Trend ({'UP' if trend_up else 'DOWN'})",
+                      width=1, dash="dash"),
+            opacity=0.45,
+            name=f"Bias ({'UP' if trend_up else 'DOWN'})",
         ), row=1, col=1)
+
+    # ── Structural trend lines + W/M patterns (drawn on the live chart) ───────
+    ts_series = candle_df["timestamp"]
+
+    def _ts(idx):
+        i = int(max(0, min(idx, len(ts_series) - 1)))
+        return ts_series.iloc[i]
+
+    try:
+        struct = analyze_trendlines(candle_df)
+    except Exception:
+        struct = {"lines": [], "shapes": [], "annotations": []}
+
+    for ln in struct.get("lines", []):
+        fig.add_trace(go.Scatter(
+            x=[_ts(i) for i in ln["x_idx"]], y=ln["y"], mode="lines",
+            line=dict(color=ln["color"], width=ln.get("width", 1.4),
+                      dash=ln.get("dash", "solid")),
+            name=ln.get("name", "Trend"),
+            hovertemplate=f"{ln.get('name','Trend')}<extra></extra>",
+        ), row=1, col=1)
+
+    for sh in struct.get("shapes", []):
+        fig.add_trace(go.Scatter(
+            x=[_ts(i) for i in sh["x_idx"]], y=sh["y"], mode="lines+markers",
+            line=dict(color=sh["color"], width=2.2),
+            marker=dict(size=8, color=sh["color"]),
+            name=sh.get("name", "Pattern"),
+            hovertemplate=f"{sh.get('name','Pattern')}<extra></extra>",
+        ), row=1, col=1)
+
+    for an in struct.get("annotations", []):
+        fig.add_annotation(
+            x=_ts(an["x_idx"]), y=an["y"], text=an["text"], showarrow=True,
+            arrowhead=2, arrowcolor=an["color"], arrowsize=0.8,
+            font=dict(color=an["color"], size=10, family="monospace"),
+            bgcolor="rgba(0,0,0,0.65)", row=1, col=1,
+        )
 
     # Volume bars
     colors = ["#00cc66" if c >= o else "#cc2222"
@@ -514,7 +555,7 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
         height=520,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        title=dict(text=f"NIFTY50 | {tf_minutes}min Chart", font=dict(size=14, color="#fff")),
+        title=dict(text=f"{instrument_label} | {tf_minutes}min Chart", font=dict(size=14, color="#fff")),
     )
     fig.update_xaxes(
         gridcolor="#1e2130", showgrid=True,
@@ -736,9 +777,14 @@ def render_paper_trade_tab(patterns, spot: float, options_df=None, candle_df=Non
                         if exit_idx >= 0 and option_ltp > 0:
                             try:
                                 exit_candle_ts = candle_df["timestamp"].iloc[exit_idx]
-                                spot_at_exit = float(candle_df["close"].iloc[exit_idx])
+                                # Price the exit at the SPOT LEVEL THAT WAS HIT
+                                # (stop-loss on a LOSS, target on a PROFIT) — not
+                                # the candle close, which can wick to SL then close
+                                # back the other way and flip the option P&L sign.
+                                exit_spot = (float(pat.stop_loss) if exit_status == "LOSS"
+                                             else float(pat.target))
                                 exit_option_price = _bs_option_price(
-                                    spot_at_exit, trade_strike, opt_type, exit_candle_ts)
+                                    exit_spot, trade_strike, opt_type, exit_candle_ts)
                             except Exception:
                                 pass
                         exit_info = {
@@ -1654,31 +1700,48 @@ def _render_instrument_section(instrument: str, selected_tf: int):
     """Fetch data and render all 7 sub-tabs for one instrument."""
     cfg = INSTRUMENT_CONFIG.get(instrument, INSTRUMENT_CONFIG["NIFTY"])
 
-    # Fetch LTP / spot
-    spot = fetch_ltp_for(instrument)
-    if spot and spot > 0:
-        st.session_state[f"_last_ltp_{instrument}"] = spot
-    else:
-        spot = st.session_state.get(f"_last_ltp_{instrument}", 0.0)
+    # ── Fetch all data; never let one instrument's failure crash the page ─────
+    try:
+        spot = fetch_ltp_for(instrument)
+        if spot and spot > 0:
+            st.session_state[f"_last_ltp_{instrument}"] = spot
+        else:
+            spot = st.session_state.get(f"_last_ltp_{instrument}", 0.0)
 
-    # Candles
-    candle_df_wide = fetch_candle_data_for(instrument, selected_tf, 200)
-    candle_df = filter_to_latest_day(candle_df_wide)
+        candle_df_wide = fetch_candle_data_for(instrument, selected_tf, 200)
+        candle_df = filter_to_latest_day(candle_df_wide)
 
-    # Multi-timeframe candles (OI table)
-    candle_data_by_tf = {tf: fetch_candle_data_for(instrument, tf, 80)
-                         for tf in [1, 2, 5, 10, 15, 30, 60]}
+        candle_data_by_tf = {tf: fetch_candle_data_for(instrument, tf, 80)
+                             for tf in [1, 2, 5, 10, 15, 30, 60]}
 
-    # Options chain
-    expiry_dt = get_next_expiry_for(instrument)
-    expiry_str = get_expiry_string(expiry_dt)
-    options_df = fetch_options_chain_for(instrument, expiry_str)
+        expiry_dt = get_next_expiry_for(instrument)
+        expiry_str = get_expiry_string(expiry_dt)
+        options_df = fetch_options_chain_for(instrument, expiry_str)
+    except Exception as e:
+        st.error(f"⚠️ Could not load {cfg['display_name']} data: {e}")
+        if not is_connected():
+            st.info("🔌 Connect to AngelOne (top of page) to load live data.")
+        return
+
     if options_df is None or options_df.empty:
         cached = st.session_state.get(f"_last_options_df_{instrument}")
         if cached is not None and not cached.empty:
             options_df = cached
     if options_df is not None and not options_df.empty:
         st.session_state[f"_last_options_df_{instrument}"] = options_df
+
+    # If there's no price/candle data at all, show a clear message and stop.
+    if (spot is None or spot <= 0) and (candle_df is None or candle_df.empty):
+        exp_lbl = "monthly" if cfg.get("expiry_type") == "monthly" else "weekly"
+        st.warning(
+            f"📭 No live {cfg['display_name']} data available right now "
+            f"(expiry cycle: {exp_lbl}). This can happen when the market is "
+            f"closed or AngelOne hasn't returned data for this symbol/exchange "
+            f"({cfg['exchange']}/{cfg['opt_exchange']})."
+        )
+        if not is_connected():
+            st.info("🔌 Connect to AngelOne (top of page) to load live data.")
+        return
 
     # Pattern detection
     patterns = []
@@ -1714,7 +1777,8 @@ def _render_instrument_section(instrument: str, selected_tf: int):
     )
 
     # Chart
-    fig = build_chart(candle_df, patterns, oi_annotations, selected_tf)
+    fig = build_chart(candle_df, patterns, oi_annotations, selected_tf,
+                      instrument_label=cfg["display_name"])
     st.plotly_chart(fig, use_container_width=True, config={
         "displayModeBar": True,
         "displaylogo": False,

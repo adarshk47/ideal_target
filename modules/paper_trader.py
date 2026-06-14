@@ -91,6 +91,13 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
             exit_opt = exit_info.get("exit_option_price")
             if exit_opt is not None and use_option and exit_opt > 0:
                 exit_price = exit_opt
+                # Safety: a PROFIT must never close below entry and a LOSS must
+                # never close above it. Theta over the hold can marginally flip a
+                # small move, so clamp the exit to the SL/target premium bound.
+                if status == "PROFIT" and exit_price < entry:
+                    exit_price = max(entry, target)
+                elif status == "LOSS" and exit_price > entry:
+                    exit_price = min(entry, sl)
                 pnl = round(exit_price - entry, 2)
             elif status == "PROFIT":
                 exit_price = target

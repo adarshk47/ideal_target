@@ -936,37 +936,78 @@ INSTRUMENT_CONFIG = {
         "ltp_symbol": "NIFTY 50",
         "strike_gap": 50,
         "lot_size": 75,
-        "expiry_weekday": 1,    # Tuesday
+        "expiry_weekday": 1,        # Tuesday
+        "expiry_type": "weekly",
     },
     "SENSEX": {
         "display_name": "Sensex",
         "icon": "📊",
-        "token": "99919000",    # BSE SENSEX index token
+        "token": "99919000",        # BSE SENSEX index token
         "exchange": "BSE",
         "opt_exchange": "BFO",
         "search_prefix": "SENSEX",
         "ltp_symbol": "SENSEX",
         "strike_gap": 100,
         "lot_size": 10,
-        "expiry_weekday": 4,    # Friday (BSE weekly)
+        "expiry_weekday": 4,        # Friday (BSE weekly)
+        "expiry_type": "weekly",
     },
     "SBIN": {
         "display_name": "SBIN",
         "icon": "🏦",
-        "token": None,          # discovered dynamically via searchScrip
+        "token": None,              # discovered dynamically via searchScrip
         "exchange": "NSE",
         "opt_exchange": "NFO",
         "search_prefix": "SBIN",
         "ltp_symbol": "SBIN",
         "strike_gap": 5,
         "lot_size": 1500,
-        "expiry_weekday": 3,    # Thursday (monthly stock options)
+        "expiry_weekday": 3,        # Thursday
+        "expiry_type": "monthly",   # stock options expire LAST Thursday of month
     },
 }
 
 # Caches for dynamically discovered tokens and expiries
 _INSTR_TOKEN_CACHE: dict = {}
 _INSTR_EXPIRY_CACHE: dict = {}
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int):
+    """Return the date of the last given weekday (Mon=0..Sun=6) in a month."""
+    if month == 12:
+        nxt = _date(year + 1, 1, 1)
+    else:
+        nxt = _date(year, month + 1, 1)
+    last_day = nxt - timedelta(days=1)
+    offset = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=offset)
+
+
+def _next_monthly_expiry(weekday: int, now: datetime):
+    """Next monthly expiry = last `weekday` of the month, rolling to next month
+    once this month's expiry has passed (or closed today)."""
+    today = now.date()
+    this_month = _last_weekday_of_month(today.year, today.month, weekday)
+    if this_month > today:
+        return this_month
+    if this_month == today:
+        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now <= mkt_close:
+            return this_month
+    # Roll to next month
+    ny, nm = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+    return _last_weekday_of_month(ny, nm, weekday)
+
+
+def _next_weekly_expiry_weekday(weekday: int, now: datetime):
+    """Next weekly expiry on the given weekday, rolling past today after close."""
+    today = now.date()
+    days_ahead = (weekday - today.weekday()) % 7
+    if days_ahead == 0:
+        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now > mkt_close:
+            days_ahead = 7
+    return today + timedelta(days=days_ahead)
 
 
 def _discover_instrument_token(key: str) -> str:
@@ -1095,6 +1136,8 @@ def get_next_expiry_for(key: str):
                 dates = set()
                 for item in res["data"]:
                     sym = str(item.get("tradingsymbol", "")).upper()
+                    if not re.match(rf"^{re.escape(prefix)}\d", sym):
+                        continue
                     m = re.search(r"(\d{2}[A-Z]{3}\d{2})\d+(?:CE|PE)$", sym)
                     if m:
                         try:
@@ -1110,15 +1153,12 @@ def get_next_expiry_for(key: str):
                         return expiry_dt
         except Exception as e:
             logger.warning(f"Expiry discovery for {key}: {e}")
-    # Fallback: calculate from expiry_weekday
+    # Fallback: calculate from expiry_weekday, honouring weekly vs monthly cycle.
     wd = cfg.get("expiry_weekday", 3)
-    today = now.date()
-    days_ahead = (wd - today.weekday()) % 7
-    if days_ahead == 0:
-        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        if now > mkt_close:
-            days_ahead = 7
-    next_exp = today + timedelta(days=days_ahead)
+    if cfg.get("expiry_type") == "monthly":
+        next_exp = _next_monthly_expiry(wd, now)
+    else:
+        next_exp = _next_weekly_expiry_weekday(wd, now)
     return datetime.combine(next_exp, datetime.min.time()).replace(tzinfo=IST)
 
 
@@ -1170,6 +1210,11 @@ def fetch_options_chain_for(key: str, expiry_str: str = None) -> pd.DataFrame:
             sym = str(item.get("tradingsymbol", "")).upper()
             tok = str(item.get("symboltoken", ""))
             if not sym.endswith(("CE", "PE")) or not tok:
+                continue
+            # Symbol must be EXACTLY this underlying: prefix immediately followed
+            # by the expiry day digit. Excludes look-alikes that share the prefix
+            # (e.g. SBIN vs SBICARD / SBILIFE) which would pollute the chain.
+            if not re.match(rf"^{re.escape(prefix)}\d", sym):
                 continue
             opt_type = sym[-2:]
             # Match expiry in symbol

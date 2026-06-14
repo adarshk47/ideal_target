@@ -1,13 +1,22 @@
 """
-Chart Pattern Detection Module
-Detects candlestick and chart patterns on OHLCV data.
-Returns signals with entry, stop_loss, target, and risk/reward ratio.
+Chart Pattern Detection with Professional Scalping Techniques.
+
+Combines classic candlestick patterns with:
+  - VWAP bounce / rejection  (John Carter "Mastering the Trade")
+  - Opening Range Breakout   (ORB – first 15-min high/low)
+  - EMA 9/21 cross with VWAP filter
+  - Momentum breakout        (Al Brooks strong-close bar)
+  - ATR-based dynamic stop-losses (never fixed ±5)
+  - Multi-factor confidence scoring  (VWAP, EMA trend, RSI, volume, time)
+  - Time-of-day filter       (penalise first 30 min / last 30 min)
+  - Duplicate suppression    (no same-direction signal within 3 bars)
 """
 
+from __future__ import annotations
 import pandas as pd
 import numpy as np
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,7 +25,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PatternSignal:
     pattern: str
-    signal: str  # "BUY" or "SELL"
+    signal: str        # "BUY" or "SELL"
     index: int
     timestamp: object
     entry: float
@@ -25,7 +34,7 @@ class PatternSignal:
     risk_reward: float
     confidence: float  # 0-1
     description: str
-    color: str = "green"  # for chart annotation
+    color: str = "green"
 
     def __post_init__(self):
         self.color = "green" if self.signal == "BUY" else "red"
@@ -35,17 +44,1056 @@ class PatternSignal:
             self.risk_reward = round(reward / risk, 2)
 
 
+# ─── Technical Indicator Helpers ─────────────────────────────────────────────
+
+def _compute_ema(arr: np.ndarray, period: int) -> np.ndarray:
+    ema = np.full(len(arr), np.nan)
+    if len(arr) < period:
+        return ema
+    alpha = 2.0 / (period + 1)
+    ema[period - 1] = float(np.mean(arr[:period]))
+    for i in range(period, len(arr)):
+        ema[i] = alpha * arr[i] + (1.0 - alpha) * ema[i - 1]
+    return ema
+
+
+def _compute_atr(df: pd.DataFrame, period: int = 14) -> np.ndarray:
+    h = df["high"].values.astype(float)
+    l = df["low"].values.astype(float)
+    c = df["close"].values.astype(float)
+    n = len(df)
+    tr = np.zeros(n)
+    tr[0] = h[0] - l[0]
+    for i in range(1, n):
+        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+    atr = np.zeros(n)
+    seed = min(period, n)
+    atr[:seed] = np.mean(tr[:seed]) if seed > 0 else 1.0
+    for i in range(seed, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    return atr
+
+
+def _compute_rsi(df: pd.DataFrame, period: int = 14) -> np.ndarray:
+    closes = df["close"].values.astype(float)
+    n = len(closes)
+    rsi = np.full(n, np.nan)
+    if n < period + 2:
+        return rsi
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+    for i in range(period, n - 1):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsi[i + 1] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i + 1] = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
+
+
+def _compute_vwap(df: pd.DataFrame) -> np.ndarray:
+    """Cumulative VWAP for the session. Returns NaN array if no volume."""
+    if "volume" not in df.columns:
+        return np.full(len(df), np.nan)
+    vol = df["volume"].values.astype(float)
+    vol[vol == 0] = np.nan
+    tp = ((df["high"] + df["low"] + df["close"]) / 3).values
+    cumvol = np.nancumsum(vol)
+    cumtpvol = np.nancumsum(tp * vol)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(cumvol > 0, cumtpvol / cumvol, np.nan)
+
+
+def _opening_range(df: pd.DataFrame, minutes: int = 15):
+    """Return (or_high, or_low, or_end_idx) for the first N minutes."""
+    if "timestamp" not in df.columns or df.empty:
+        return np.nan, np.nan, -1
+    try:
+        ts = pd.to_datetime(df["timestamp"])
+        t0 = ts.iloc[0]
+        # Anchor to 9:15 IST regardless of first bar
+        market_open = t0.normalize().replace(hour=9, minute=15, second=0, microsecond=0)
+        if t0.tzinfo is not None:
+            import pytz
+            market_open = market_open.tz_localize(t0.tzinfo) if market_open.tzinfo is None else market_open
+        cutoff = market_open + pd.Timedelta(minutes=minutes)
+        mask = ts <= cutoff
+        or_df = df[mask]
+        if or_df.empty:
+            return np.nan, np.nan, -1
+        end_idx = int(mask.values.nonzero()[0][-1])
+        return float(or_df["high"].max()), float(or_df["low"].min()), end_idx
+    except Exception:
+        return np.nan, np.nan, -1
+
+
+def _volume_ratio(df: pd.DataFrame, i: int, lookback: int = 20) -> float:
+    if "volume" not in df.columns or i < 1:
+        return 1.0
+    vol = df["volume"].values.astype(float)
+    avg = float(np.mean(vol[max(0, i - lookback):i]))
+    return float(vol[i] / avg) if avg > 0 else 1.0
+
+
+def _time_score(timestamp) -> float:
+    """Confidence delta based on time of day."""
+    try:
+        ts = pd.Timestamp(timestamp)
+        m = ts.hour * 60 + ts.minute
+        if m < 9 * 60 + 45:     # first 30 min — choppy
+            return -0.06
+        if m > 15 * 60:          # last 30 min — high slippage
+            return -0.10
+        if 9 * 60 + 45 <= m <= 10 * 60 + 30:  # prime scalping window
+            return 0.05
+        if 11 * 60 <= m <= 13 * 60:             # lunch chop
+            return -0.03
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+# ─── Single-Candle Helpers ────────────────────────────────────────────────────
+
+def _body(row) -> float:
+    return abs(row["close"] - row["open"])
+
+def _range(row) -> float:
+    return row["high"] - row["low"]
+
+def _upper_wick(row) -> float:
+    return row["high"] - max(row["open"], row["close"])
+
+def _lower_wick(row) -> float:
+    return min(row["open"], row["close"]) - row["low"]
+
+
+# ─── Classic Candlestick Patterns ────────────────────────────────────────────
+
+def detect_hammer(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(5, len(df)):
+        row = df.iloc[i]
+        body = _body(row); total = _range(row)
+        lower = _lower_wick(row); upper = _upper_wick(row)
+        if total < 1 or body == 0:
+            continue
+        prior = df["close"].iloc[i - 5:i]
+        if prior.iloc[-1] >= prior.iloc[0]:
+            continue
+        if lower >= 2 * body and upper <= 0.3 * body + 0.1 and body <= 0.35 * total:
+            entry = round(row["high"] + 0.5, 2)
+            sl = round(row["low"] - 1.0, 2)
+            target = round(entry + 2.0 * (entry - sl), 2)
+            signals.append(PatternSignal(
+                pattern="Hammer", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.70, description="Hammer – Bullish reversal after downtrend",
+            ))
+    return signals
+
+
+def detect_shooting_star(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(5, len(df)):
+        row = df.iloc[i]
+        body = _body(row); total = _range(row)
+        upper = _upper_wick(row); lower = _lower_wick(row)
+        if total < 1 or body == 0:
+            continue
+        prior = df["close"].iloc[i - 5:i]
+        if prior.iloc[-1] <= prior.iloc[0]:
+            continue
+        if upper >= 2 * body and lower <= 0.3 * body + 0.1 and body <= 0.35 * total:
+            entry = round(row["low"] - 0.5, 2)
+            sl = round(row["high"] + 1.0, 2)
+            target = round(entry - 2.0 * (sl - entry), 2)
+            signals.append(PatternSignal(
+                pattern="Shooting Star", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.68, description="Shooting Star – Bearish reversal after uptrend",
+            ))
+    return signals
+
+
+def detect_inverted_hammer(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(5, len(df)):
+        row = df.iloc[i]
+        body = _body(row); total = _range(row)
+        upper = _upper_wick(row); lower = _lower_wick(row)
+        if total < 1 or body == 0:
+            continue
+        prior = df["close"].iloc[i - 5:i]
+        if prior.iloc[-1] >= prior.iloc[0]:
+            continue
+        if upper >= 2 * body and lower <= 0.2 * total and body <= 0.35 * total:
+            entry = round(row["high"] + 0.5, 2)
+            sl = round(row["low"] - 1.0, 2)
+            target = round(entry + 1.5 * (entry - sl), 2)
+            signals.append(PatternSignal(
+                pattern="Inverted Hammer", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.60, description="Inverted Hammer – Potential bullish reversal",
+            ))
+    return signals
+
+
+def detect_hanging_man(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(5, len(df)):
+        row = df.iloc[i]
+        body = _body(row); total = _range(row)
+        lower = _lower_wick(row); upper = _upper_wick(row)
+        if total < 1 or body == 0:
+            continue
+        prior = df["close"].iloc[i - 5:i]
+        if prior.iloc[-1] <= prior.iloc[0]:
+            continue
+        if lower >= 2 * body and upper <= 0.3 * body + 0.1 and body <= 0.35 * total:
+            entry = round(row["low"] - 0.5, 2)
+            sl = round(row["high"] + 1.0, 2)
+            target = round(entry - 1.5 * (sl - entry), 2)
+            signals.append(PatternSignal(
+                pattern="Hanging Man", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.63, description="Hanging Man – Bearish reversal after uptrend",
+            ))
+    return signals
+
+
+def detect_doji(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(3, len(df)):
+        row = df.iloc[i]
+        body = _body(row); total = _range(row)
+        if total < 1 or body / total >= 0.05:
+            continue
+        prior = df["close"].iloc[i - 3:i]
+        in_uptrend = prior.iloc[-1] > prior.iloc[0]
+        if in_uptrend:
+            entry = round(row["low"] - 0.5, 2)
+            sl = round(row["high"] + 1.0, 2)
+            target = round(entry - 1.5 * (sl - entry), 2)
+            signals.append(PatternSignal(
+                pattern="Doji", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.53, description="Doji – Indecision at top, potential reversal",
+            ))
+        else:
+            entry = round(row["high"] + 0.5, 2)
+            sl = round(row["low"] - 1.0, 2)
+            target = round(entry + 1.5 * (entry - sl), 2)
+            signals.append(PatternSignal(
+                pattern="Doji", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.53, description="Doji – Indecision at bottom, potential reversal",
+            ))
+    return signals
+
+
+def detect_dragonfly_doji(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(3, len(df)):
+        row = df.iloc[i]
+        body = _body(row); total = _range(row)
+        if total < 1:
+            continue
+        if body / total < 0.07 and _upper_wick(row) / total < 0.05 and _lower_wick(row) / total > 0.7:
+            entry = round(row["close"] + 0.5, 2)
+            sl = round(row["low"] - 1.0, 2)
+            target = round(entry + 2.0 * (entry - sl), 2)
+            signals.append(PatternSignal(
+                pattern="Dragonfly Doji", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.66, description="Dragonfly Doji – Strong bullish reversal",
+            ))
+    return signals
+
+
+def detect_gravestone_doji(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(3, len(df)):
+        row = df.iloc[i]
+        body = _body(row); total = _range(row)
+        if total < 1:
+            continue
+        if body / total < 0.07 and _lower_wick(row) / total < 0.05 and _upper_wick(row) / total > 0.7:
+            entry = round(row["close"] - 0.5, 2)
+            sl = round(row["high"] + 1.0, 2)
+            target = round(entry - 2.0 * (sl - entry), 2)
+            signals.append(PatternSignal(
+                pattern="Gravestone Doji", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.66, description="Gravestone Doji – Strong bearish reversal",
+            ))
+    return signals
+
+
+def detect_pin_bar(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(5, len(df)):
+        row = df.iloc[i]
+        body = _body(row); total = _range(row)
+        upper = _upper_wick(row); lower = _lower_wick(row)
+        if total < 2:
+            continue
+        prior = df["close"].iloc[i - 5:i]
+        in_uptrend = prior.iloc[-1] > prior.iloc[0]
+        if in_uptrend and upper >= 0.65 * total and body <= 0.25 * total and lower <= 0.2 * total:
+            entry = round(row["low"] - 0.5, 2)
+            sl = round(row["high"] + 1.0, 2)
+            target = round(entry - 2.5 * (sl - entry), 2)
+            signals.append(PatternSignal(
+                pattern="Pin Bar (Bearish)", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.71, description="Bearish Pin Bar – Rejection of highs",
+            ))
+        elif not in_uptrend and lower >= 0.65 * total and body <= 0.25 * total and upper <= 0.2 * total:
+            entry = round(row["high"] + 0.5, 2)
+            sl = round(row["low"] - 1.0, 2)
+            target = round(entry + 2.5 * (entry - sl), 2)
+            signals.append(PatternSignal(
+                pattern="Pin Bar (Bullish)", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.71, description="Bullish Pin Bar – Rejection of lows",
+            ))
+    return signals
+
+
+def detect_engulfing(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(6, len(df)):
+        curr = df.iloc[i]; prev = df.iloc[i - 1]
+        curr_body = _body(curr); prev_body = _body(prev)
+        if prev_body < 1:
+            continue
+        prior = df["close"].iloc[i - 6:i - 1]
+        in_down = prior.iloc[-1] < prior.iloc[0]
+        in_up   = prior.iloc[-1] > prior.iloc[0]
+        if (in_down and prev["close"] < prev["open"] and curr["close"] > curr["open"]
+                and curr["open"] < prev["close"] and curr["close"] > prev["open"]
+                and curr_body > prev_body):
+            entry = round(curr["close"] + 0.5, 2)
+            sl    = round(min(curr["low"], prev["low"]) - 1.0, 2)
+            target = round(entry + 2.0 * (entry - sl), 2)
+            signals.append(PatternSignal(
+                pattern="Bullish Engulfing", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.76, description="Bullish Engulfing – Strong reversal",
+            ))
+        elif (in_up and prev["close"] > prev["open"] and curr["close"] < curr["open"]
+              and curr["open"] > prev["close"] and curr["close"] < prev["open"]
+              and curr_body > prev_body):
+            entry = round(curr["close"] - 0.5, 2)
+            sl    = round(max(curr["high"], prev["high"]) + 1.0, 2)
+            target = round(entry - 2.0 * (sl - entry), 2)
+            signals.append(PatternSignal(
+                pattern="Bearish Engulfing", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.76, description="Bearish Engulfing – Strong reversal",
+            ))
+    return signals
+
+
+def detect_inside_bar(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(5, len(df)):
+        curr = df.iloc[i]; prev = df.iloc[i - 1]
+        if curr["high"] < prev["high"] and curr["low"] > prev["low"] and _range(prev) > 2:
+            prior = df["close"].iloc[i - 5:i - 1]
+            in_up = prior.iloc[-1] > prior.iloc[0]
+            if in_up:
+                entry = round(prev["high"] + 0.5, 2)
+                sl    = round(prev["low"] - 1.0, 2)
+                target = round(entry + 2.0 * (entry - sl), 2)
+                signals.append(PatternSignal(
+                    pattern="Inside Bar (Bullish)", signal="BUY", index=i,
+                    timestamp=df["timestamp"].iloc[i], entry=entry,
+                    stop_loss=sl, target=target, risk_reward=0,
+                    confidence=0.63, description="Inside Bar – Bullish breakout pending",
+                ))
+            else:
+                entry = round(prev["low"] - 0.5, 2)
+                sl    = round(prev["high"] + 1.0, 2)
+                target = round(entry - 2.0 * (sl - entry), 2)
+                signals.append(PatternSignal(
+                    pattern="Inside Bar (Bearish)", signal="SELL", index=i,
+                    timestamp=df["timestamp"].iloc[i], entry=entry,
+                    stop_loss=sl, target=target, risk_reward=0,
+                    confidence=0.63, description="Inside Bar – Bearish breakout pending",
+                ))
+    return signals
+
+
+def detect_morning_star(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(7, len(df)):
+        c1 = df.iloc[i - 2]; c2 = df.iloc[i - 1]; c3 = df.iloc[i]
+        prior = df["close"].iloc[i - 7:i - 2]
+        if prior.iloc[-1] >= prior.iloc[0]:
+            continue
+        if (c1["close"] < c1["open"] and c3["close"] > c3["open"]
+                and _body(c2) < 0.4 * _body(c1) and _body(c3) > 0.5 * _body(c1)
+                and c3["close"] > c1["open"] + (c1["close"] - c1["open"]) * 0.3):
+            entry = round(c3["close"] + 0.5, 2)
+            sl    = round(c2["low"] - 1.0, 2)
+            target = round(entry + 2.5 * (entry - sl), 2)
+            signals.append(PatternSignal(
+                pattern="Morning Star", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.78, description="Morning Star – Strong bullish reversal",
+            ))
+    return signals
+
+
+def detect_evening_star(df: pd.DataFrame) -> List[PatternSignal]:
+    signals = []
+    for i in range(7, len(df)):
+        c1 = df.iloc[i - 2]; c2 = df.iloc[i - 1]; c3 = df.iloc[i]
+        prior = df["close"].iloc[i - 7:i - 2]
+        if prior.iloc[-1] <= prior.iloc[0]:
+            continue
+        if (c1["close"] > c1["open"] and c3["close"] < c3["open"]
+                and _body(c2) < 0.4 * _body(c1) and _body(c3) > 0.5 * _body(c1)
+                and c3["close"] < c1["open"] + (c1["close"] - c1["open"]) * 0.3):
+            entry = round(c3["close"] - 0.5, 2)
+            sl    = round(c2["high"] + 1.0, 2)
+            target = round(entry - 2.5 * (sl - entry), 2)
+            signals.append(PatternSignal(
+                pattern="Evening Star", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.78, description="Evening Star – Strong bearish reversal",
+            ))
+    return signals
+
+
+# ─── Multi-Candle Chart Patterns ──────────────────────────────────────────────
+
+def _find_peaks(arr: np.ndarray, min_dist: int = 3) -> List[int]:
+    peaks = []
+    for i in range(1, len(arr) - 1):
+        if arr[i] > arr[i - 1] and arr[i] > arr[i + 1]:
+            if not peaks or (i - peaks[-1]) >= min_dist:
+                peaks.append(i)
+            elif arr[i] > arr[peaks[-1]]:
+                peaks[-1] = i
+    return peaks
+
+
+def _find_troughs(arr: np.ndarray, min_dist: int = 3) -> List[int]:
+    troughs = []
+    for i in range(1, len(arr) - 1):
+        if arr[i] < arr[i - 1] and arr[i] < arr[i + 1]:
+            if not troughs or (i - troughs[-1]) >= min_dist:
+                troughs.append(i)
+            elif arr[i] < arr[troughs[-1]]:
+                troughs[-1] = i
+    return troughs
+
+
+def detect_double_top(df: pd.DataFrame, window: int = 30, tol: float = 0.003) -> List[PatternSignal]:
+    signals = []
+    if len(df) < window:
+        return signals
+    for i in range(window, len(df)):
+        seg = df.iloc[i - window:i]
+        highs = seg["high"].values; lows = seg["low"].values
+        peaks = _find_peaks(highs, min_dist=5)
+        if len(peaks) < 2:
+            continue
+        p1, p2 = peaks[-2], peaks[-1]
+        if abs(highs[p1] - highs[p2]) / highs[p1] > tol:
+            continue
+        valley = lows[p1:p2]
+        if len(valley) == 0:
+            continue
+        neck = float(np.min(valley))
+        if df["close"].iloc[i - 1] < neck:
+            top = max(highs[p1], highs[p2])
+            entry = round(neck - 0.5, 2)
+            sl    = round(top + 1.0, 2)
+            target = round(neck - (top - neck), 2)
+            signals.append(PatternSignal(
+                pattern="Double Top", signal="SELL", index=i - 1,
+                timestamp=df["timestamp"].iloc[i - 1], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.73, description=f"Double Top at {top:.0f} – Breakdown below neck {neck:.0f}",
+            ))
+    return signals
+
+
+def detect_double_bottom(df: pd.DataFrame, window: int = 30, tol: float = 0.003) -> List[PatternSignal]:
+    signals = []
+    if len(df) < window:
+        return signals
+    for i in range(window, len(df)):
+        seg = df.iloc[i - window:i]
+        lows = seg["low"].values; highs = seg["high"].values
+        troughs = _find_troughs(lows, min_dist=5)
+        if len(troughs) < 2:
+            continue
+        t1, t2 = troughs[-2], troughs[-1]
+        if abs(lows[t1] - lows[t2]) / lows[t1] > tol:
+            continue
+        peak_highs = highs[t1:t2]
+        if len(peak_highs) == 0:
+            continue
+        neck = float(np.max(peak_highs))
+        if df["close"].iloc[i - 1] > neck:
+            bot = min(lows[t1], lows[t2])
+            entry = round(neck + 0.5, 2)
+            sl    = round(bot - 1.0, 2)
+            target = round(neck + (neck - bot), 2)
+            signals.append(PatternSignal(
+                pattern="Double Bottom", signal="BUY", index=i - 1,
+                timestamp=df["timestamp"].iloc[i - 1], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.73, description=f"Double Bottom at {bot:.0f} – Breakout above neck {neck:.0f}",
+            ))
+    return signals
+
+
+def detect_head_and_shoulders(df: pd.DataFrame, window: int = 40) -> List[PatternSignal]:
+    signals = []
+    if len(df) < window:
+        return signals
+    for i in range(window, len(df)):
+        seg = df.iloc[i - window:i]
+        highs = seg["high"].values; lows = seg["low"].values
+        peaks = _find_peaks(highs, min_dist=4)
+        if len(peaks) < 3:
+            continue
+        ls, head, rs = peaks[-3], peaks[-2], peaks[-1]
+        if not (highs[head] > highs[ls] and highs[head] > highs[rs]):
+            continue
+        if abs(highs[ls] - highs[rs]) / highs[ls] > 0.015:
+            continue
+        troughs = _find_troughs(lows[ls:rs + 1], min_dist=2)
+        if len(troughs) < 2:
+            continue
+        neck = float(np.mean([lows[ls + troughs[0]], lows[ls + troughs[-1]]]))
+        if df["close"].iloc[i - 1] < neck:
+            entry = round(neck - 0.5, 2)
+            sl    = round(highs[rs] + 1.0, 2)
+            target = round(neck - (highs[head] - neck), 2)
+            signals.append(PatternSignal(
+                pattern="Head & Shoulders", signal="SELL", index=i - 1,
+                timestamp=df["timestamp"].iloc[i - 1], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.80, description=f"H&S – Breakdown below neckline {neck:.0f}",
+            ))
+    return signals
+
+
+def detect_inverse_head_and_shoulders(df: pd.DataFrame, window: int = 40) -> List[PatternSignal]:
+    signals = []
+    if len(df) < window:
+        return signals
+    for i in range(window, len(df)):
+        seg = df.iloc[i - window:i]
+        highs = seg["high"].values; lows = seg["low"].values
+        troughs = _find_troughs(lows, min_dist=4)
+        if len(troughs) < 3:
+            continue
+        ls, head, rs = troughs[-3], troughs[-2], troughs[-1]
+        if not (lows[head] < lows[ls] and lows[head] < lows[rs]):
+            continue
+        if abs(lows[ls] - lows[rs]) / lows[ls] > 0.015:
+            continue
+        peaks = _find_peaks(highs[ls:rs + 1], min_dist=2)
+        if len(peaks) < 2:
+            continue
+        neck = float(np.mean([highs[ls + peaks[0]], highs[ls + peaks[-1]]]))
+        if df["close"].iloc[i - 1] > neck:
+            entry = round(neck + 0.5, 2)
+            sl    = round(lows[rs] - 1.0, 2)
+            target = round(neck + (neck - lows[head]), 2)
+            signals.append(PatternSignal(
+                pattern="Inv. Head & Shoulders", signal="BUY", index=i - 1,
+                timestamp=df["timestamp"].iloc[i - 1], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.80, description=f"Inv. H&S – Breakout above neckline {neck:.0f}",
+            ))
+    return signals
+
+
+def detect_ascending_triangle(df: pd.DataFrame, window: int = 30) -> List[PatternSignal]:
+    signals = []
+    if len(df) < window:
+        return signals
+    for i in range(window, len(df)):
+        seg = df.iloc[i - window:i]
+        highs = seg["high"].values; lows = seg["low"].values
+        recent_highs = highs[-10:]
+        resistance = float(np.mean(recent_highs))
+        if np.std(recent_highs) / resistance >= 0.005:
+            continue
+        slope = float(np.polyfit(range(len(lows)), lows, 1)[0])
+        if slope <= 0:
+            continue
+        if df["close"].iloc[i - 1] > resistance:
+            entry = round(resistance + 0.5, 2)
+            sl    = round(float(lows[-1]) - 1.0, 2)
+            target = round(resistance + (resistance - float(np.min(lows[-window:]))), 2)
+            signals.append(PatternSignal(
+                pattern="Ascending Triangle", signal="BUY", index=i - 1,
+                timestamp=df["timestamp"].iloc[i - 1], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.71, description=f"Ascending Triangle breakout above {resistance:.0f}",
+            ))
+    return signals
+
+
+def detect_descending_triangle(df: pd.DataFrame, window: int = 30) -> List[PatternSignal]:
+    signals = []
+    if len(df) < window:
+        return signals
+    for i in range(window, len(df)):
+        seg = df.iloc[i - window:i]
+        highs = seg["high"].values; lows = seg["low"].values
+        recent_lows = lows[-10:]
+        support = float(np.mean(recent_lows))
+        if np.std(recent_lows) / support >= 0.005:
+            continue
+        slope = float(np.polyfit(range(len(highs)), highs, 1)[0])
+        if slope >= 0:
+            continue
+        if df["close"].iloc[i - 1] < support:
+            entry = round(support - 0.5, 2)
+            sl    = round(float(highs[-1]) + 1.0, 2)
+            target = round(support - (float(np.max(highs[-window:])) - support), 2)
+            signals.append(PatternSignal(
+                pattern="Descending Triangle", signal="SELL", index=i - 1,
+                timestamp=df["timestamp"].iloc[i - 1], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.71, description=f"Descending Triangle breakdown below {support:.0f}",
+            ))
+    return signals
+
+
+def detect_bull_flag(df: pd.DataFrame, pole_bars: int = 10, flag_bars: int = 10) -> List[PatternSignal]:
+    signals = []
+    if len(df) < pole_bars + flag_bars + 5:
+        return signals
+    for i in range(pole_bars + flag_bars, len(df)):
+        pole = df.iloc[i - pole_bars - flag_bars:i - flag_bars]
+        flag = df.iloc[i - flag_bars:i]
+        pole_gain = (pole["close"].iloc[-1] - pole["close"].iloc[0]) / pole["close"].iloc[0]
+        if pole_gain < 0.01:
+            continue
+        flag_range = flag["high"].max() - flag["low"].min()
+        pole_range = pole["high"].max() - pole["low"].min()
+        if flag_range > 0.5 * pole_range:
+            continue
+        slope = float(np.polyfit(range(len(flag)), flag["close"].values, 1)[0])
+        if slope > 0.2:
+            continue
+        if df["close"].iloc[i - 1] > flag["high"].max():
+            entry = round(float(flag["high"].max()) + 0.5, 2)
+            sl    = round(float(flag["low"].min()) - 1.0, 2)
+            target = round(entry + pole_range, 2)
+            signals.append(PatternSignal(
+                pattern="Bull Flag", signal="BUY", index=i - 1,
+                timestamp=df["timestamp"].iloc[i - 1], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.74, description="Bull Flag – Bullish continuation breakout",
+            ))
+    return signals
+
+
+def detect_bear_flag(df: pd.DataFrame, pole_bars: int = 10, flag_bars: int = 10) -> List[PatternSignal]:
+    signals = []
+    if len(df) < pole_bars + flag_bars + 5:
+        return signals
+    for i in range(pole_bars + flag_bars, len(df)):
+        pole = df.iloc[i - pole_bars - flag_bars:i - flag_bars]
+        flag = df.iloc[i - flag_bars:i]
+        pole_loss = (pole["close"].iloc[0] - pole["close"].iloc[-1]) / pole["close"].iloc[0]
+        if pole_loss < 0.01:
+            continue
+        flag_range = flag["high"].max() - flag["low"].min()
+        pole_range = pole["high"].max() - pole["low"].min()
+        if flag_range > 0.5 * pole_range:
+            continue
+        slope = float(np.polyfit(range(len(flag)), flag["close"].values, 1)[0])
+        if slope < -0.2:
+            continue
+        if df["close"].iloc[i - 1] < flag["low"].min():
+            entry = round(float(flag["low"].min()) - 0.5, 2)
+            sl    = round(float(flag["high"].max()) + 1.0, 2)
+            target = round(entry - pole_range, 2)
+            signals.append(PatternSignal(
+                pattern="Bear Flag", signal="SELL", index=i - 1,
+                timestamp=df["timestamp"].iloc[i - 1], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.74, description="Bear Flag – Bearish continuation breakdown",
+            ))
+    return signals
+
+
+# ─── Professional Scalping Patterns ──────────────────────────────────────────
+
+def detect_vwap_bounce(df: pd.DataFrame, vwap: np.ndarray,
+                        atr: np.ndarray) -> List[PatternSignal]:
+    """
+    VWAP Bounce/Rejection – price touches VWAP and reverses.
+    High-probability scalp setup (John Carter, Tom Williams).
+    """
+    signals = []
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    for i in range(5, len(df)):
+        if np.isnan(vwap[i]) or np.isnan(atr[i]) or atr[i] <= 0:
+            continue
+        v = vwap[i]; band = v * 0.0012  # 0.12% touch band
+        atr_v = atr[i]
+
+        # Bullish bounce: wick penetrates below VWAP, candle closes back above
+        if lows[i] < v - band and closes[i] > v + band:
+            prior = closes[max(0, i - 5):i]
+            if len(prior) > 1 and prior[-1] < prior[0]:   # down into VWAP
+                entry = round(closes[i] + 0.5, 2)
+                sl    = round(lows[i] - 0.5 * atr_v, 2)
+                target = round(entry + 2.0 * (entry - sl), 2)
+                signals.append(PatternSignal(
+                    pattern="VWAP Bounce (Bullish)", signal="BUY", index=i,
+                    timestamp=df["timestamp"].iloc[i], entry=entry,
+                    stop_loss=sl, target=target, risk_reward=0,
+                    confidence=0.74, description=f"VWAP bounce at {v:.0f} – buyers stepped in",
+                ))
+
+        # Bearish rejection: wick above VWAP, candle closes back below
+        elif highs[i] > v + band and closes[i] < v - band:
+            prior = closes[max(0, i - 5):i]
+            if len(prior) > 1 and prior[-1] > prior[0]:   # up into VWAP
+                entry = round(closes[i] - 0.5, 2)
+                sl    = round(highs[i] + 0.5 * atr_v, 2)
+                target = round(entry - 2.0 * (sl - entry), 2)
+                signals.append(PatternSignal(
+                    pattern="VWAP Rejection (Bearish)", signal="SELL", index=i,
+                    timestamp=df["timestamp"].iloc[i], entry=entry,
+                    stop_loss=sl, target=target, risk_reward=0,
+                    confidence=0.74, description=f"VWAP rejection at {v:.0f} – sellers defending",
+                ))
+    return signals
+
+
+def detect_orb_breakout(df: pd.DataFrame, or_high: float, or_low: float,
+                          or_end_idx: int, atr: np.ndarray) -> List[PatternSignal]:
+    """
+    Opening Range Breakout (ORB) – first confirmed close outside first-15-min range.
+    One signal per direction per session.
+    """
+    signals = []
+    if np.isnan(or_high) or np.isnan(or_low) or or_end_idx < 0:
+        return signals
+    or_range = or_high - or_low
+    if or_range <= 0:
+        return signals
+    closes = df["close"].values
+    bullish_done = bearish_done = False
+    for i in range(or_end_idx + 1, len(df)):
+        if np.isnan(atr[i]):
+            continue
+        atr_v = atr[i]
+        if not bullish_done and closes[i] > or_high:
+            # Check no earlier bar already closed above
+            if not any(closes[or_end_idx + 1:i] > or_high):
+                entry  = round(or_high + 0.5, 2)
+                sl     = round(or_high - 0.4 * atr_v, 2)
+                target = round(entry + or_range, 2)
+                signals.append(PatternSignal(
+                    pattern="ORB Breakout (Bullish)", signal="BUY", index=i,
+                    timestamp=df["timestamp"].iloc[i], entry=entry,
+                    stop_loss=sl, target=target, risk_reward=0,
+                    confidence=0.77, description=f"ORB breakout above {or_high:.0f} (range {or_range:.0f})",
+                ))
+                bullish_done = True
+        if not bearish_done and closes[i] < or_low:
+            if not any(closes[or_end_idx + 1:i] < or_low):
+                entry  = round(or_low - 0.5, 2)
+                sl     = round(or_low + 0.4 * atr_v, 2)
+                target = round(entry - or_range, 2)
+                signals.append(PatternSignal(
+                    pattern="ORB Breakdown (Bearish)", signal="SELL", index=i,
+                    timestamp=df["timestamp"].iloc[i], entry=entry,
+                    stop_loss=sl, target=target, risk_reward=0,
+                    confidence=0.77, description=f"ORB breakdown below {or_low:.0f} (range {or_range:.0f})",
+                ))
+                bearish_done = True
+        if bullish_done and bearish_done:
+            break
+    return signals
+
+
+def detect_ema_cross(df: pd.DataFrame, ema9: np.ndarray, ema21: np.ndarray,
+                      vwap: np.ndarray, atr: np.ndarray) -> List[PatternSignal]:
+    """
+    EMA 9/21 crossover with VWAP-side filter.
+    Bullish: EMA9 > EMA21 and price above VWAP.
+    Bearish: EMA9 < EMA21 and price below VWAP.
+    """
+    signals = []
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    for i in range(22, len(df)):
+        if (np.isnan(ema9[i]) or np.isnan(ema21[i]) or np.isnan(atr[i])
+                or np.isnan(ema9[i - 1]) or np.isnan(ema21[i - 1])):
+            continue
+        atr_v = atr[i]
+        vwap_ok_buy  = np.isnan(vwap[i]) or closes[i] > vwap[i]
+        vwap_ok_sell = np.isnan(vwap[i]) or closes[i] < vwap[i]
+
+        if ema9[i - 1] <= ema21[i - 1] and ema9[i] > ema21[i]:
+            entry  = round(closes[i] + 0.5, 2)
+            sl     = round(min(lows[i], lows[i - 1]) - 0.4 * atr_v, 2)
+            target = round(entry + 2.0 * (entry - sl), 2)
+            conf   = 0.72 if vwap_ok_buy else 0.59
+            signals.append(PatternSignal(
+                pattern="EMA 9/21 Cross (Bullish)", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=conf, description=f"EMA9 crossed above EMA21 at {closes[i]:.0f}",
+            ))
+
+        elif ema9[i - 1] >= ema21[i - 1] and ema9[i] < ema21[i]:
+            entry  = round(closes[i] - 0.5, 2)
+            sl     = round(max(highs[i], highs[i - 1]) + 0.4 * atr_v, 2)
+            target = round(entry - 2.0 * (sl - entry), 2)
+            conf   = 0.72 if vwap_ok_sell else 0.59
+            signals.append(PatternSignal(
+                pattern="EMA 9/21 Cross (Bearish)", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=conf, description=f"EMA9 crossed below EMA21 at {closes[i]:.0f}",
+            ))
+    return signals
+
+
+def detect_momentum_breakout(df: pd.DataFrame, vwap: np.ndarray,
+                               atr: np.ndarray) -> List[PatternSignal]:
+    """
+    Momentum breakout – candle closes in top/bottom 25% of range with body > 60% of range.
+    Al Brooks "strong close" concept: buyers/sellers completely in control.
+    Only fires when the current ATR is above median (active market).
+    """
+    signals = []
+    if len(df) < 20:
+        return signals
+    closes = df["close"].values
+    opens  = df["open"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    atr_median = float(np.median(atr[~np.isnan(atr)])) if np.any(~np.isnan(atr)) else 1.0
+
+    for i in range(10, len(df)):
+        if np.isnan(atr[i]) or atr[i] < 0.5 * atr_median:
+            continue  # Skip low-volatility bars
+        total = highs[i] - lows[i]
+        if total <= 0:
+            continue
+        body_pos = (closes[i] - lows[i]) / total  # 0=at low, 1=at high
+        body_frac = abs(closes[i] - opens[i]) / total
+
+        if body_frac >= 0.60 and body_pos >= 0.75 and closes[i] > opens[i]:
+            prior_trend = closes[i] > float(np.mean(closes[max(0, i - 10):i]))
+            vwap_align  = np.isnan(vwap[i]) or closes[i] > vwap[i]
+            entry  = round(closes[i] + 0.5, 2)
+            sl     = round(lows[i] - 0.5 * atr[i], 2)
+            target = round(entry + 1.8 * (entry - sl), 2)
+            conf   = 0.67 + (0.05 if prior_trend else 0) + (0.04 if vwap_align else 0)
+            signals.append(PatternSignal(
+                pattern="Momentum Breakout (Bullish)", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=round(conf, 2), description=f"Strong bullish close at {closes[i]:.0f}",
+            ))
+
+        elif body_frac >= 0.60 and body_pos <= 0.25 and closes[i] < opens[i]:
+            prior_trend = closes[i] < float(np.mean(closes[max(0, i - 10):i]))
+            vwap_align  = np.isnan(vwap[i]) or closes[i] < vwap[i]
+            entry  = round(closes[i] - 0.5, 2)
+            sl     = round(highs[i] + 0.5 * atr[i], 2)
+            target = round(entry - 1.8 * (sl - entry), 2)
+            conf   = 0.67 + (0.05 if prior_trend else 0) + (0.04 if vwap_align else 0)
+            signals.append(PatternSignal(
+                pattern="Momentum Breakout (Bearish)", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=round(conf, 2), description=f"Strong bearish close at {closes[i]:.0f}",
+            ))
+    return signals
+
+
+def detect_rsi_reversal(df: pd.DataFrame, rsi: np.ndarray, atr: np.ndarray,
+                          ema9: np.ndarray, ema21: np.ndarray) -> List[PatternSignal]:
+    """
+    RSI extreme + EMA trend alignment reversal.
+    Oversold (<35) with EMA9 starting to turn up → BUY scalp.
+    Overbought (>65) with EMA9 starting to turn down → SELL scalp.
+    """
+    signals = []
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    for i in range(22, len(df)):
+        if (np.isnan(rsi[i]) or np.isnan(rsi[i - 1])
+                or np.isnan(atr[i]) or atr[i] <= 0
+                or np.isnan(ema9[i]) or np.isnan(ema9[i - 1])):
+            continue
+        atr_v = atr[i]
+
+        # Oversold bounce: RSI was <35, now rising; EMA9 also ticking up
+        if rsi[i - 1] < 35 and rsi[i] > rsi[i - 1] and ema9[i] >= ema9[i - 1]:
+            entry  = round(closes[i] + 0.5, 2)
+            sl     = round(lows[i] - 0.6 * atr_v, 2)
+            target = round(entry + 2.0 * (entry - sl), 2)
+            signals.append(PatternSignal(
+                pattern="RSI Oversold Bounce", signal="BUY", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.69, description=f"RSI oversold bounce ({rsi[i-1]:.0f}→{rsi[i]:.0f})",
+            ))
+
+        # Overbought reversal: RSI was >65, now falling; EMA9 ticking down
+        elif rsi[i - 1] > 65 and rsi[i] < rsi[i - 1] and ema9[i] <= ema9[i - 1]:
+            entry  = round(closes[i] - 0.5, 2)
+            sl     = round(highs[i] + 0.6 * atr_v, 2)
+            target = round(entry - 2.0 * (sl - entry), 2)
+            signals.append(PatternSignal(
+                pattern="RSI Overbought Reversal", signal="SELL", index=i,
+                timestamp=df["timestamp"].iloc[i], entry=entry,
+                stop_loss=sl, target=target, risk_reward=0,
+                confidence=0.69, description=f"RSI overbought reversal ({rsi[i-1]:.0f}→{rsi[i]:.0f})",
+            ))
+    return signals
+
+
+# ─── Multi-Factor Post-Processor ─────────────────────────────────────────────
+
+def _apply_multi_factor(signals: List[PatternSignal], df: pd.DataFrame,
+                         vwap: np.ndarray, atr: np.ndarray,
+                         ema9: np.ndarray, ema21: np.ndarray,
+                         rsi: np.ndarray) -> List[PatternSignal]:
+    """
+    For every signal:
+    1. Widen stop to ATR-minimum if it was set too tight (common with fixed offsets).
+    2. Score VWAP alignment, EMA trend, RSI zone, volume, time-of-day.
+    3. Recompute risk_reward from updated levels.
+    """
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    enhanced = []
+
+    for sig in signals:
+        i = sig.index
+        if i >= len(df):
+            enhanced.append(sig); continue
+
+        # ── ATR-based minimum stop ─────────────────────────────────────────
+        if not np.isnan(atr[i]) and atr[i] > 0:
+            atr_v = atr[i]
+            min_stop_dist = 0.6 * atr_v
+            current_risk  = abs(sig.entry - sig.stop_loss)
+            if current_risk < min_stop_dist:
+                if sig.signal == "BUY":
+                    sig.stop_loss = round(sig.entry - min_stop_dist, 2)
+                    sig.target    = round(sig.entry + 2.0 * min_stop_dist, 2)
+                else:
+                    sig.stop_loss = round(sig.entry + min_stop_dist, 2)
+                    sig.target    = round(sig.entry - 2.0 * min_stop_dist, 2)
+
+        # ── Multi-factor scoring ──────────────────────────────────────────
+        score = 0
+
+        # 1. VWAP alignment
+        if i < len(vwap) and not np.isnan(vwap[i]):
+            if sig.signal == "BUY"  and closes[i] > vwap[i]: score += 1
+            elif sig.signal == "SELL" and closes[i] < vwap[i]: score += 1
+            else: score -= 1   # trading against VWAP
+
+        # 2. EMA 9/21 trend direction
+        if (i < len(ema9) and i < len(ema21)
+                and not np.isnan(ema9[i]) and not np.isnan(ema21[i])):
+            if sig.signal == "BUY"  and ema9[i] > ema21[i]: score += 1
+            elif sig.signal == "SELL" and ema9[i] < ema21[i]: score += 1
+
+        # 3. RSI zone (avoid entering extremes against direction)
+        if i < len(rsi) and not np.isnan(rsi[i]):
+            r = rsi[i]
+            if sig.signal == "BUY"  and 38 <= r <= 68: score += 1
+            elif sig.signal == "SELL" and 32 <= r <= 62: score += 1
+            if sig.signal == "BUY"  and r > 78: score -= 1  # chasing overbought
+            if sig.signal == "SELL" and r < 22: score -= 1  # chasing oversold
+
+        # 4. Volume surge
+        vol_ratio = _volume_ratio(df, i)
+        if   vol_ratio >= 2.0: score += 2
+        elif vol_ratio >= 1.4: score += 1
+        elif vol_ratio <  0.7: score -= 1
+
+        # 5. Time-of-day
+        td = _time_score(sig.timestamp)
+        if   td > 0:  score += 1
+        elif td < 0:  score -= 1
+
+        sig.confidence = round(min(0.93, max(0.38, sig.confidence + score * 0.04)), 2)
+
+        # Recompute risk_reward
+        risk   = abs(sig.entry - sig.stop_loss)
+        reward = abs(sig.target - sig.entry)
+        sig.risk_reward = round(reward / risk, 2) if risk > 0 else 0.0
+
+        enhanced.append(sig)
+    return enhanced
+
+
+# ─── Main Entry Point ─────────────────────────────────────────────────────────
+
 def detect_all_patterns(df: pd.DataFrame) -> List[PatternSignal]:
     """
     Run all pattern detectors on OHLCV dataframe.
-    Returns list of PatternSignal objects sorted by index.
+    Applies multi-factor scoring, ATR-based stops, and duplicate filtering.
+    Returns List[PatternSignal] sorted by bar index.
     """
     if df is None or len(df) < 10:
         return []
 
-    signals = []
+    # Pre-compute indicators once
+    closes_arr = df["close"].values.astype(float)
+    vwap  = _compute_vwap(df)
+    atr   = _compute_atr(df, period=14)
+    ema9  = _compute_ema(closes_arr, 9)
+    ema21 = _compute_ema(closes_arr, 21)
+    rsi   = _compute_rsi(df, period=14)
+    or_high, or_low, or_end = _opening_range(df, minutes=15)
 
+    signals: List[PatternSignal] = []
     try:
+        # ── Classic candlestick patterns ──────────────────────────────────
         signals += detect_hammer(df)
         signals += detect_shooting_star(df)
         signals += detect_inverted_hammer(df)
@@ -66,1018 +1114,43 @@ def detect_all_patterns(df: pd.DataFrame) -> List[PatternSignal]:
         signals += detect_descending_triangle(df)
         signals += detect_bull_flag(df)
         signals += detect_bear_flag(df)
+
+        # ── Professional scalping patterns ────────────────────────────────
+        signals += detect_vwap_bounce(df, vwap, atr)
+        signals += detect_orb_breakout(df, or_high, or_low, or_end, atr)
+        signals += detect_ema_cross(df, ema9, ema21, vwap, atr)
+        signals += detect_momentum_breakout(df, vwap, atr)
+        signals += detect_rsi_reversal(df, rsi, atr, ema9, ema21)
+
     except Exception as e:
         logger.error(f"Pattern detection error: {e}")
 
-    # Deduplicate: keep highest confidence per index
-    seen_indices = {}
+    # Apply multi-factor scoring & ATR-based stop widening
+    signals = _apply_multi_factor(signals, df, vwap, atr, ema9, ema21, rsi)
+
+    # Quality gates
+    signals = [s for s in signals if s.confidence >= 0.56 and s.risk_reward >= 1.4]
+
+    # Deduplicate: best confidence per index
+    best: dict[int, PatternSignal] = {}
     for sig in signals:
-        if sig.index not in seen_indices or sig.confidence > seen_indices[sig.index].confidence:
-            seen_indices[sig.index] = sig
+        if sig.index not in best or sig.confidence > best[sig.index].confidence:
+            best[sig.index] = sig
 
-    return sorted(seen_indices.values(), key=lambda x: x.index)
+    # Sort by bar index
+    sorted_sigs = sorted(best.values(), key=lambda x: x.index)
 
-
-# ─── Single-Candle Patterns ────────────────────────────────────────────────────
-
-def _body_size(row) -> float:
-    return abs(row["close"] - row["open"])
-
-
-def _candle_range(row) -> float:
-    return row["high"] - row["low"]
-
-
-def _upper_shadow(row) -> float:
-    return row["high"] - max(row["open"], row["close"])
-
-
-def _lower_shadow(row) -> float:
-    return min(row["open"], row["close"]) - row["low"]
-
-
-def detect_hammer(df: pd.DataFrame) -> List[PatternSignal]:
-    """
-    Hammer: small body at top, long lower shadow (>=2x body), small upper shadow.
-    Appears in downtrend. Bullish reversal.
-    """
-    signals = []
-    for i in range(5, len(df)):
-        row = df.iloc[i]
-        body = _body_size(row)
-        total = _candle_range(row)
-        lower = _lower_shadow(row)
-        upper = _upper_shadow(row)
-
-        if total < 1:
+    # Suppress consecutive same-direction signals within 3 bars
+    filtered: List[PatternSignal] = []
+    for sig in sorted_sigs:
+        if not filtered:
+            filtered.append(sig)
             continue
-
-        # Prior trend must be down
-        prior_closes = df["close"].iloc[i - 5:i]
-        in_downtrend = prior_closes.iloc[-1] < prior_closes.iloc[0]
-
-        if (
-            in_downtrend
-            and body > 0
-            and lower >= 2 * body
-            and upper <= 0.3 * body + 0.1
-            and body <= 0.35 * total
-        ):
-            entry = row["high"] + 0.5
-            sl = row["low"] - 5
-            target = entry + 2 * (entry - sl)
-            signals.append(PatternSignal(
-                pattern="Hammer",
-                signal="BUY",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.72,
-                description="Hammer - Bullish reversal after downtrend",
-            ))
-    return signals
-
-
-def detect_shooting_star(df: pd.DataFrame) -> List[PatternSignal]:
-    """
-    Shooting Star: small body at bottom, long upper shadow (>=2x body), small lower shadow.
-    Appears in uptrend. Bearish reversal.
-    """
-    signals = []
-    for i in range(5, len(df)):
-        row = df.iloc[i]
-        body = _body_size(row)
-        total = _candle_range(row)
-        upper = _upper_shadow(row)
-        lower = _lower_shadow(row)
-
-        if total < 1:
-            continue
-
-        prior_closes = df["close"].iloc[i - 5:i]
-        in_uptrend = prior_closes.iloc[-1] > prior_closes.iloc[0]
-
-        if (
-            in_uptrend
-            and body > 0
-            and upper >= 2 * body
-            and lower <= 0.3 * body + 0.1
-            and body <= 0.35 * total
-        ):
-            entry = row["low"] - 0.5
-            sl = row["high"] + 5
-            target = entry - 2 * (sl - entry)
-            signals.append(PatternSignal(
-                pattern="Shooting Star",
-                signal="SELL",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.70,
-                description="Shooting Star - Bearish reversal after uptrend",
-            ))
-    return signals
-
-
-def detect_inverted_hammer(df: pd.DataFrame) -> List[PatternSignal]:
-    """
-    Inverted Hammer: appears in downtrend. Small body at bottom, long upper shadow.
-    Potential bullish reversal.
-    """
-    signals = []
-    for i in range(5, len(df)):
-        row = df.iloc[i]
-        body = _body_size(row)
-        total = _candle_range(row)
-        upper = _upper_shadow(row)
-        lower = _lower_shadow(row)
-
-        if total < 1:
-            continue
-
-        prior_closes = df["close"].iloc[i - 5:i]
-        in_downtrend = prior_closes.iloc[-1] < prior_closes.iloc[0]
-
-        if (
-            in_downtrend
-            and body > 0
-            and upper >= 2 * body
-            and lower <= 0.2 * total
-            and body <= 0.35 * total
-        ):
-            entry = row["high"] + 0.5
-            sl = row["low"] - 5
-            target = entry + 1.5 * (entry - sl)
-            signals.append(PatternSignal(
-                pattern="Inverted Hammer",
-                signal="BUY",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.62,
-                description="Inverted Hammer - Potential bullish reversal",
-            ))
-    return signals
-
-
-def detect_hanging_man(df: pd.DataFrame) -> List[PatternSignal]:
-    """
-    Hanging Man: same shape as hammer but appears in uptrend. Bearish reversal.
-    """
-    signals = []
-    for i in range(5, len(df)):
-        row = df.iloc[i]
-        body = _body_size(row)
-        total = _candle_range(row)
-        lower = _lower_shadow(row)
-        upper = _upper_shadow(row)
-
-        if total < 1:
-            continue
-
-        prior_closes = df["close"].iloc[i - 5:i]
-        in_uptrend = prior_closes.iloc[-1] > prior_closes.iloc[0]
-
-        if (
-            in_uptrend
-            and body > 0
-            and lower >= 2 * body
-            and upper <= 0.3 * body + 0.1
-            and body <= 0.35 * total
-        ):
-            entry = row["low"] - 0.5
-            sl = row["high"] + 5
-            target = entry - 1.5 * (sl - entry)
-            signals.append(PatternSignal(
-                pattern="Hanging Man",
-                signal="SELL",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.65,
-                description="Hanging Man - Bearish reversal after uptrend",
-            ))
-    return signals
-
-
-def detect_doji(df: pd.DataFrame) -> List[PatternSignal]:
-    """
-    Doji: open ≈ close, can signal reversal.
-    """
-    signals = []
-    for i in range(3, len(df)):
-        row = df.iloc[i]
-        body = _body_size(row)
-        total = _candle_range(row)
-
-        if total < 1:
-            continue
-
-        if body / total < 0.05:  # Very small body
-            prior_closes = df["close"].iloc[i - 3:i]
-            in_uptrend = prior_closes.iloc[-1] > prior_closes.iloc[0]
-
-            if in_uptrend:
-                entry = row["low"] - 0.5
-                sl = row["high"] + 5
-                target = entry - 1.5 * (sl - entry)
-                signals.append(PatternSignal(
-                    pattern="Doji",
-                    signal="SELL",
-                    index=i,
-                    timestamp=df["timestamp"].iloc[i],
-                    entry=entry,
-                    stop_loss=sl,
-                    target=target,
-                    risk_reward=0,
-                    confidence=0.55,
-                    description="Doji - Indecision, potential reversal",
-                ))
-            else:
-                entry = row["high"] + 0.5
-                sl = row["low"] - 5
-                target = entry + 1.5 * (entry - sl)
-                signals.append(PatternSignal(
-                    pattern="Doji",
-                    signal="BUY",
-                    index=i,
-                    timestamp=df["timestamp"].iloc[i],
-                    entry=entry,
-                    stop_loss=sl,
-                    target=target,
-                    risk_reward=0,
-                    confidence=0.55,
-                    description="Doji - Indecision, potential reversal",
-                ))
-    return signals
-
-
-def detect_dragonfly_doji(df: pd.DataFrame) -> List[PatternSignal]:
-    """Dragonfly Doji: open=high=close, long lower shadow. Bullish."""
-    signals = []
-    for i in range(3, len(df)):
-        row = df.iloc[i]
-        body = _body_size(row)
-        upper = _upper_shadow(row)
-        lower = _lower_shadow(row)
-        total = _candle_range(row)
-
-        if total < 1:
-            continue
-
-        if (
-            body / total < 0.07
-            and upper / total < 0.05
-            and lower / total > 0.7
-        ):
-            entry = row["close"] + 0.5
-            sl = row["low"] - 5
-            target = entry + 2 * (entry - sl)
-            signals.append(PatternSignal(
-                pattern="Dragonfly Doji",
-                signal="BUY",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.68,
-                description="Dragonfly Doji - Strong bullish reversal",
-            ))
-    return signals
-
-
-def detect_gravestone_doji(df: pd.DataFrame) -> List[PatternSignal]:
-    """Gravestone Doji: open=low=close, long upper shadow. Bearish."""
-    signals = []
-    for i in range(3, len(df)):
-        row = df.iloc[i]
-        body = _body_size(row)
-        upper = _upper_shadow(row)
-        lower = _lower_shadow(row)
-        total = _candle_range(row)
-
-        if total < 1:
-            continue
-
-        if (
-            body / total < 0.07
-            and lower / total < 0.05
-            and upper / total > 0.7
-        ):
-            entry = row["close"] - 0.5
-            sl = row["high"] + 5
-            target = entry - 2 * (sl - entry)
-            signals.append(PatternSignal(
-                pattern="Gravestone Doji",
-                signal="SELL",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.68,
-                description="Gravestone Doji - Strong bearish reversal",
-            ))
-    return signals
-
-
-def detect_pin_bar(df: pd.DataFrame) -> List[PatternSignal]:
-    """
-    Pin Bar: long wick (at least 2/3 of total range), small body on opposite end.
-    Context-dependent direction.
-    """
-    signals = []
-    for i in range(5, len(df)):
-        row = df.iloc[i]
-        body = _body_size(row)
-        total = _candle_range(row)
-        upper = _upper_shadow(row)
-        lower = _lower_shadow(row)
-
-        if total < 2:
-            continue
-
-        prior_closes = df["close"].iloc[i - 5:i]
-        in_uptrend = prior_closes.iloc[-1] > prior_closes.iloc[0]
-
-        # Bearish pin bar (upper wick dominant)
-        if (
-            in_uptrend
-            and upper >= 0.65 * total
-            and body <= 0.25 * total
-            and lower <= 0.2 * total
-        ):
-            entry = row["low"] - 0.5
-            sl = row["high"] + 5
-            target = entry - 2.5 * (sl - entry)
-            signals.append(PatternSignal(
-                pattern="Pin Bar (Bearish)",
-                signal="SELL",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.73,
-                description="Bearish Pin Bar - Rejection of highs",
-            ))
-        # Bullish pin bar (lower wick dominant)
-        elif (
-            not in_uptrend
-            and lower >= 0.65 * total
-            and body <= 0.25 * total
-            and upper <= 0.2 * total
-        ):
-            entry = row["high"] + 0.5
-            sl = row["low"] - 5
-            target = entry + 2.5 * (entry - sl)
-            signals.append(PatternSignal(
-                pattern="Pin Bar (Bullish)",
-                signal="BUY",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.73,
-                description="Bullish Pin Bar - Rejection of lows",
-            ))
-    return signals
-
-
-# ─── Two-Candle Patterns ──────────────────────────────────────────────────────
-
-def detect_engulfing(df: pd.DataFrame) -> List[PatternSignal]:
-    """Bullish and Bearish Engulfing patterns."""
-    signals = []
-    for i in range(6, len(df)):
-        curr = df.iloc[i]
-        prev = df.iloc[i - 1]
-
-        curr_body = _body_size(curr)
-        prev_body = _body_size(prev)
-
-        if prev_body < 1:
-            continue
-
-        prior_closes = df["close"].iloc[i - 6:i - 1]
-        in_downtrend = prior_closes.iloc[-1] < prior_closes.iloc[0]
-        in_uptrend = prior_closes.iloc[-1] > prior_closes.iloc[0]
-
-        # Bullish Engulfing
-        if (
-            in_downtrend
-            and prev["close"] < prev["open"]  # prev is bearish
-            and curr["close"] > curr["open"]  # curr is bullish
-            and curr["open"] < prev["close"]
-            and curr["close"] > prev["open"]
-            and curr_body > prev_body
-        ):
-            entry = curr["close"] + 0.5
-            sl = min(curr["low"], prev["low"]) - 5
-            target = entry + 2 * (entry - sl)
-            signals.append(PatternSignal(
-                pattern="Bullish Engulfing",
-                signal="BUY",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.78,
-                description="Bullish Engulfing - Strong reversal signal",
-            ))
-
-        # Bearish Engulfing
-        elif (
-            in_uptrend
-            and prev["close"] > prev["open"]  # prev is bullish
-            and curr["close"] < curr["open"]  # curr is bearish
-            and curr["open"] > prev["close"]
-            and curr["close"] < prev["open"]
-            and curr_body > prev_body
-        ):
-            entry = curr["close"] - 0.5
-            sl = max(curr["high"], prev["high"]) + 5
-            target = entry - 2 * (sl - entry)
-            signals.append(PatternSignal(
-                pattern="Bearish Engulfing",
-                signal="SELL",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.78,
-                description="Bearish Engulfing - Strong reversal signal",
-            ))
-    return signals
-
-
-def detect_inside_bar(df: pd.DataFrame) -> List[PatternSignal]:
-    """
-    Inside Bar: second candle's high/low is inside first candle's range.
-    Breakout trade.
-    """
-    signals = []
-    for i in range(5, len(df)):
-        curr = df.iloc[i]
-        prev = df.iloc[i - 1]
-
-        if (
-            curr["high"] < prev["high"]
-            and curr["low"] > prev["low"]
-            and _candle_range(prev) > 2
-        ):
-            prior_closes = df["close"].iloc[i - 5:i - 1]
-            in_uptrend = prior_closes.iloc[-1] > prior_closes.iloc[0]
-
-            if in_uptrend:
-                entry = prev["high"] + 0.5
-                sl = prev["low"] - 5
-                target = entry + 2 * (entry - sl)
-                signals.append(PatternSignal(
-                    pattern="Inside Bar (Bullish)",
-                    signal="BUY",
-                    index=i,
-                    timestamp=df["timestamp"].iloc[i],
-                    entry=entry,
-                    stop_loss=sl,
-                    target=target,
-                    risk_reward=0,
-                    confidence=0.65,
-                    description="Inside Bar - Bullish breakout pending",
-                ))
-            else:
-                entry = prev["low"] - 0.5
-                sl = prev["high"] + 5
-                target = entry - 2 * (sl - entry)
-                signals.append(PatternSignal(
-                    pattern="Inside Bar (Bearish)",
-                    signal="SELL",
-                    index=i,
-                    timestamp=df["timestamp"].iloc[i],
-                    entry=entry,
-                    stop_loss=sl,
-                    target=target,
-                    risk_reward=0,
-                    confidence=0.65,
-                    description="Inside Bar - Bearish breakout pending",
-                ))
-    return signals
-
-
-# ─── Three-Candle Patterns ─────────────────────────────────────────────────────
-
-def detect_morning_star(df: pd.DataFrame) -> List[PatternSignal]:
-    """Morning Star: downtrend + big bearish + small body + big bullish. Bullish reversal."""
-    signals = []
-    for i in range(7, len(df)):
-        c1 = df.iloc[i - 2]
-        c2 = df.iloc[i - 1]
-        c3 = df.iloc[i]
-
-        prior = df["close"].iloc[i - 7:i - 2]
-        in_downtrend = prior.iloc[-1] < prior.iloc[0]
-
-        if not in_downtrend:
-            continue
-
-        c1_bearish = c1["close"] < c1["open"]
-        c3_bullish = c3["close"] > c3["open"]
-        c1_body = _body_size(c1)
-        c2_body = _body_size(c2)
-        c3_body = _body_size(c3)
-
-        if (
-            c1_bearish
-            and c3_bullish
-            and c2_body < 0.4 * c1_body
-            and c3_body > 0.5 * c1_body
-            and c3["close"] > c1["open"] + (c1["close"] - c1["open"]) * 0.3
-        ):
-            entry = c3["close"] + 0.5
-            sl = c2["low"] - 5
-            target = entry + 2.5 * (entry - sl)
-            signals.append(PatternSignal(
-                pattern="Morning Star",
-                signal="BUY",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.80,
-                description="Morning Star - Strong bullish reversal",
-            ))
-    return signals
-
-
-def detect_evening_star(df: pd.DataFrame) -> List[PatternSignal]:
-    """Evening Star: uptrend + big bullish + small body + big bearish. Bearish reversal."""
-    signals = []
-    for i in range(7, len(df)):
-        c1 = df.iloc[i - 2]
-        c2 = df.iloc[i - 1]
-        c3 = df.iloc[i]
-
-        prior = df["close"].iloc[i - 7:i - 2]
-        in_uptrend = prior.iloc[-1] > prior.iloc[0]
-
-        if not in_uptrend:
-            continue
-
-        c1_bullish = c1["close"] > c1["open"]
-        c3_bearish = c3["close"] < c3["open"]
-        c1_body = _body_size(c1)
-        c2_body = _body_size(c2)
-        c3_body = _body_size(c3)
-
-        if (
-            c1_bullish
-            and c3_bearish
-            and c2_body < 0.4 * c1_body
-            and c3_body > 0.5 * c1_body
-            and c3["close"] < c1["open"] + (c1["close"] - c1["open"]) * 0.3
-        ):
-            entry = c3["close"] - 0.5
-            sl = c2["high"] + 5
-            target = entry - 2.5 * (sl - entry)
-            signals.append(PatternSignal(
-                pattern="Evening Star",
-                signal="SELL",
-                index=i,
-                timestamp=df["timestamp"].iloc[i],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.80,
-                description="Evening Star - Strong bearish reversal",
-            ))
-    return signals
-
-
-# ─── Multi-Candle / Chart Patterns ────────────────────────────────────────────
-
-def detect_double_top(df: pd.DataFrame, window: int = 30, tolerance: float = 0.003) -> List[PatternSignal]:
-    """Double Top: two similar highs with a valley. Bearish reversal."""
-    signals = []
-    if len(df) < window:
-        return signals
-
-    for i in range(window, len(df)):
-        segment = df.iloc[i - window:i]
-        highs = segment["high"].values
-        lows = segment["low"].values
-
-        # Find two prominent highs
-        peak_indices = _find_peaks(highs, min_dist=5)
-        if len(peak_indices) < 2:
-            continue
-
-        p1_idx = peak_indices[-2]
-        p2_idx = peak_indices[-1]
-        p1_val = highs[p1_idx]
-        p2_val = highs[p2_idx]
-
-        # Check peaks are similar height
-        if abs(p1_val - p2_val) / p1_val > tolerance:
-            continue
-
-        # Valley between peaks
-        valley_lows = lows[p1_idx:p2_idx]
-        if len(valley_lows) == 0:
-            continue
-        neckline = np.min(valley_lows)
-
-        # Current price must be breaking below neckline
-        current_close = df["close"].iloc[i - 1]
-        if current_close < neckline:
-            double_top_high = max(p1_val, p2_val)
-            pattern_height = double_top_high - neckline
-            entry = neckline - 0.5
-            sl = double_top_high + 5
-            target = neckline - pattern_height
-            signals.append(PatternSignal(
-                pattern="Double Top",
-                signal="SELL",
-                index=i - 1,
-                timestamp=df["timestamp"].iloc[i - 1],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.75,
-                description=f"Double Top at {double_top_high:.0f} - Bearish reversal",
-            ))
-    return signals
-
-
-def detect_double_bottom(df: pd.DataFrame, window: int = 30, tolerance: float = 0.003) -> List[PatternSignal]:
-    """Double Bottom: two similar lows with a peak. Bullish reversal."""
-    signals = []
-    if len(df) < window:
-        return signals
-
-    for i in range(window, len(df)):
-        segment = df.iloc[i - window:i]
-        lows = segment["low"].values
-        highs = segment["high"].values
-
-        trough_indices = _find_troughs(lows, min_dist=5)
-        if len(trough_indices) < 2:
-            continue
-
-        t1_idx = trough_indices[-2]
-        t2_idx = trough_indices[-1]
-        t1_val = lows[t1_idx]
-        t2_val = lows[t2_idx]
-
-        if abs(t1_val - t2_val) / t1_val > tolerance:
-            continue
-
-        peak_highs = highs[t1_idx:t2_idx]
-        if len(peak_highs) == 0:
-            continue
-        neckline = np.max(peak_highs)
-
-        current_close = df["close"].iloc[i - 1]
-        if current_close > neckline:
-            double_bottom_low = min(t1_val, t2_val)
-            pattern_height = neckline - double_bottom_low
-            entry = neckline + 0.5
-            sl = double_bottom_low - 5
-            target = neckline + pattern_height
-            signals.append(PatternSignal(
-                pattern="Double Bottom",
-                signal="BUY",
-                index=i - 1,
-                timestamp=df["timestamp"].iloc[i - 1],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.75,
-                description=f"Double Bottom at {double_bottom_low:.0f} - Bullish reversal",
-            ))
-    return signals
-
-
-def detect_head_and_shoulders(df: pd.DataFrame, window: int = 40) -> List[PatternSignal]:
-    """Head & Shoulders: left shoulder, head (higher), right shoulder. Bearish."""
-    signals = []
-    if len(df) < window:
-        return signals
-
-    for i in range(window, len(df)):
-        segment = df.iloc[i - window:i]
-        highs = segment["high"].values
-        lows = segment["low"].values
-
-        peaks = _find_peaks(highs, min_dist=4)
-        if len(peaks) < 3:
-            continue
-
-        ls, head, rs = peaks[-3], peaks[-2], peaks[-1]
-        ls_val, head_val, rs_val = highs[ls], highs[head], highs[rs]
-
-        # Head must be highest, shoulders roughly equal
-        if not (head_val > ls_val and head_val > rs_val):
-            continue
-        if abs(ls_val - rs_val) / ls_val > 0.015:
-            continue
-
-        # Neckline from troughs between shoulders and head
-        troughs = _find_troughs(lows[ls:rs + 1], min_dist=2)
-        if len(troughs) < 2:
-            continue
-        neckline = np.mean([lows[ls + troughs[0]], lows[ls + troughs[-1]]])
-
-        current_close = df["close"].iloc[i - 1]
-        if current_close < neckline:
-            pattern_height = head_val - neckline
-            entry = neckline - 0.5
-            sl = rs_val + 5
-            target = neckline - pattern_height
-            signals.append(PatternSignal(
-                pattern="Head & Shoulders",
-                signal="SELL",
-                index=i - 1,
-                timestamp=df["timestamp"].iloc[i - 1],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.82,
-                description=f"Head & Shoulders - Breakdown below neckline {neckline:.0f}",
-            ))
-    return signals
-
-
-def detect_inverse_head_and_shoulders(df: pd.DataFrame, window: int = 40) -> List[PatternSignal]:
-    """Inverse H&S: bullish reversal pattern."""
-    signals = []
-    if len(df) < window:
-        return signals
-
-    for i in range(window, len(df)):
-        segment = df.iloc[i - window:i]
-        highs = segment["high"].values
-        lows = segment["low"].values
-
-        troughs = _find_troughs(lows, min_dist=4)
-        if len(troughs) < 3:
-            continue
-
-        ls, head, rs = troughs[-3], troughs[-2], troughs[-1]
-        ls_val, head_val, rs_val = lows[ls], lows[head], lows[rs]
-
-        if not (head_val < ls_val and head_val < rs_val):
-            continue
-        if abs(ls_val - rs_val) / ls_val > 0.015:
-            continue
-
-        peaks = _find_peaks(highs[ls:rs + 1], min_dist=2)
-        if len(peaks) < 2:
-            continue
-        neckline = np.mean([highs[ls + peaks[0]], highs[ls + peaks[-1]]])
-
-        current_close = df["close"].iloc[i - 1]
-        if current_close > neckline:
-            pattern_height = neckline - head_val
-            entry = neckline + 0.5
-            sl = rs_val - 5
-            target = neckline + pattern_height
-            signals.append(PatternSignal(
-                pattern="Inv. Head & Shoulders",
-                signal="BUY",
-                index=i - 1,
-                timestamp=df["timestamp"].iloc[i - 1],
-                entry=entry,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.82,
-                description=f"Inv. H&S - Breakout above neckline {neckline:.0f}",
-            ))
-    return signals
-
-
-def detect_ascending_triangle(df: pd.DataFrame, window: int = 30) -> List[PatternSignal]:
-    """Ascending Triangle: flat resistance + rising support. Bullish breakout."""
-    signals = []
-    if len(df) < window:
-        return signals
-
-    for i in range(window, len(df)):
-        segment = df.iloc[i - window:i]
-        highs = segment["high"].values
-        lows = segment["low"].values
-
-        # Resistance: flat highs
-        recent_highs = highs[-10:]
-        resistance = np.mean(recent_highs)
-        high_std = np.std(recent_highs)
-
-        # Support: rising lows
-        x = np.arange(len(lows))
-        coeffs = np.polyfit(x, lows, 1)
-        slope = coeffs[0]
-
-        if slope > 0 and high_std / resistance < 0.005:
-            current_close = df["close"].iloc[i - 1]
-            if current_close > resistance:
-                sl = lows[-1] - 5
-                target = resistance + (resistance - np.min(lows[-window:]))
-                signals.append(PatternSignal(
-                    pattern="Ascending Triangle",
-                    signal="BUY",
-                    index=i - 1,
-                    timestamp=df["timestamp"].iloc[i - 1],
-                    entry=resistance + 0.5,
-                    stop_loss=sl,
-                    target=target,
-                    risk_reward=0,
-                    confidence=0.73,
-                    description=f"Ascending Triangle breakout above {resistance:.0f}",
-                ))
-    return signals
-
-
-def detect_descending_triangle(df: pd.DataFrame, window: int = 30) -> List[PatternSignal]:
-    """Descending Triangle: flat support + falling resistance. Bearish breakdown."""
-    signals = []
-    if len(df) < window:
-        return signals
-
-    for i in range(window, len(df)):
-        segment = df.iloc[i - window:i]
-        highs = segment["high"].values
-        lows = segment["low"].values
-
-        recent_lows = lows[-10:]
-        support = np.mean(recent_lows)
-        low_std = np.std(recent_lows)
-
-        x = np.arange(len(highs))
-        coeffs = np.polyfit(x, highs, 1)
-        slope = coeffs[0]
-
-        if slope < 0 and low_std / support < 0.005:
-            current_close = df["close"].iloc[i - 1]
-            if current_close < support:
-                sl = highs[-1] + 5
-                target = support - (np.max(highs[-window:]) - support)
-                signals.append(PatternSignal(
-                    pattern="Descending Triangle",
-                    signal="SELL",
-                    index=i - 1,
-                    timestamp=df["timestamp"].iloc[i - 1],
-                    entry=support - 0.5,
-                    stop_loss=sl,
-                    target=target,
-                    risk_reward=0,
-                    confidence=0.73,
-                    description=f"Descending Triangle breakdown below {support:.0f}",
-                ))
-    return signals
-
-
-def detect_bull_flag(df: pd.DataFrame, pole_bars: int = 10, flag_bars: int = 10) -> List[PatternSignal]:
-    """Bull Flag: strong up move (pole) + consolidation (flag). Bullish continuation."""
-    signals = []
-    if len(df) < pole_bars + flag_bars + 5:
-        return signals
-
-    for i in range(pole_bars + flag_bars, len(df)):
-        pole = df.iloc[i - pole_bars - flag_bars:i - flag_bars]
-        flag = df.iloc[i - flag_bars:i]
-
-        pole_gain = (pole["close"].iloc[-1] - pole["close"].iloc[0]) / pole["close"].iloc[0]
-        if pole_gain < 0.01:
-            continue
-
-        flag_low = flag["low"].min()
-        flag_high = flag["high"].max()
-        flag_range = flag_high - flag_low
-
-        # Flag should retrace less than 50% of pole
-        pole_range = pole["high"].max() - pole["low"].min()
-        if flag_range > 0.5 * pole_range:
-            continue
-
-        # Slight downward or sideways flag
-        flag_slope = np.polyfit(range(len(flag)), flag["close"].values, 1)[0]
-        if flag_slope > 0.2:
-            continue
-
-        current_close = df["close"].iloc[i - 1]
-        if current_close > flag_high:
-            sl = flag_low - 5
-            target = flag_high + pole_range
-            signals.append(PatternSignal(
-                pattern="Bull Flag",
-                signal="BUY",
-                index=i - 1,
-                timestamp=df["timestamp"].iloc[i - 1],
-                entry=flag_high + 0.5,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.76,
-                description="Bull Flag - Bullish continuation breakout",
-            ))
-    return signals
-
-
-def detect_bear_flag(df: pd.DataFrame, pole_bars: int = 10, flag_bars: int = 10) -> List[PatternSignal]:
-    """Bear Flag: strong down move (pole) + consolidation (flag). Bearish continuation."""
-    signals = []
-    if len(df) < pole_bars + flag_bars + 5:
-        return signals
-
-    for i in range(pole_bars + flag_bars, len(df)):
-        pole = df.iloc[i - pole_bars - flag_bars:i - flag_bars]
-        flag = df.iloc[i - flag_bars:i]
-
-        pole_loss = (pole["close"].iloc[0] - pole["close"].iloc[-1]) / pole["close"].iloc[0]
-        if pole_loss < 0.01:
-            continue
-
-        flag_low = flag["low"].min()
-        flag_high = flag["high"].max()
-        flag_range = flag_high - flag_low
-
-        pole_range = pole["high"].max() - pole["low"].min()
-        if flag_range > 0.5 * pole_range:
-            continue
-
-        # Slight upward or sideways flag
-        flag_slope = np.polyfit(range(len(flag)), flag["close"].values, 1)[0]
-        if flag_slope < -0.2:
-            continue
-
-        current_close = df["close"].iloc[i - 1]
-        if current_close < flag_low:
-            sl = flag_high + 5
-            target = flag_low - pole_range
-            signals.append(PatternSignal(
-                pattern="Bear Flag",
-                signal="SELL",
-                index=i - 1,
-                timestamp=df["timestamp"].iloc[i - 1],
-                entry=flag_low - 0.5,
-                stop_loss=sl,
-                target=target,
-                risk_reward=0,
-                confidence=0.76,
-                description="Bear Flag - Bearish continuation breakdown",
-            ))
-    return signals
-
-
-# ─── Helper utilities ─────────────────────────────────────────────────────────
-
-def _find_peaks(arr: np.ndarray, min_dist: int = 3) -> List[int]:
-    """Find local maxima indices with minimum distance between them."""
-    peaks = []
-    for i in range(1, len(arr) - 1):
-        if arr[i] > arr[i - 1] and arr[i] > arr[i + 1]:
-            if not peaks or (i - peaks[-1]) >= min_dist:
-                peaks.append(i)
-            elif arr[i] > arr[peaks[-1]]:
-                peaks[-1] = i
-    return peaks
-
-
-def _find_troughs(arr: np.ndarray, min_dist: int = 3) -> List[int]:
-    """Find local minima indices with minimum distance between them."""
-    troughs = []
-    for i in range(1, len(arr) - 1):
-        if arr[i] < arr[i - 1] and arr[i] < arr[i + 1]:
-            if not troughs or (i - troughs[-1]) >= min_dist:
-                troughs.append(i)
-            elif arr[i] < arr[troughs[-1]]:
-                troughs[-1] = i
-    return troughs
+        last = filtered[-1]
+        if sig.index - last.index < 3 and sig.signal == last.signal:
+            if sig.confidence > last.confidence:
+                filtered[-1] = sig
+        else:
+            filtered.append(sig)
+
+    return filtered

@@ -36,6 +36,7 @@ class PatternSignal:
     description: str
     color: str = "green"
     counter_trend: bool = False  # True if signal opposes both VWAP & EMA trend
+    above_vwap: bool = True      # True if price is on the VWAP side that favours the signal
 
     def __post_init__(self):
         self.color = "green" if self.signal == "BUY" else "red"
@@ -1043,6 +1044,7 @@ def _apply_multi_factor(signals: List[PatternSignal], df: pd.DataFrame,
             else:
                 score -= 1   # trading against VWAP
                 vwap_against = True
+                sig.above_vwap = False
 
         # 2. EMA 9/21 trend direction
         if (i < len(ema9) and i < len(ema21)
@@ -1088,10 +1090,14 @@ def _apply_multi_factor(signals: List[PatternSignal], df: pd.DataFrame,
 
 # ─── Main Entry Point ─────────────────────────────────────────────────────────
 
-def detect_all_patterns(df: pd.DataFrame) -> List[PatternSignal]:
+def detect_all_patterns(df: pd.DataFrame, buy_only: bool = True) -> List[PatternSignal]:
     """
     Run all pattern detectors on OHLCV dataframe.
     Applies multi-factor scoring, ATR-based stops, and duplicate filtering.
+
+    buy_only: when True (default) only long/BUY (CE) setups are returned and
+              every BUY must have VWAP support (price above VWAP) — we buy
+              strength, never a falling knife. SELL/PE signals are dropped.
     Returns List[PatternSignal] sorted by bar index.
     """
     if df is None or len(df) < 10:
@@ -1148,6 +1154,11 @@ def detect_all_patterns(df: pd.DataFrame) -> List[PatternSignal]:
     # so a signal fighting both is filtered out entirely.
     signals = [s for s in signals
                if s.confidence >= 0.58 and s.risk_reward >= 1.2 and not s.counter_trend]
+
+    # BUY-only mode: keep long/CE setups, and require VWAP support so we only
+    # buy strength (price above VWAP) instead of catching morning down-moves.
+    if buy_only:
+        signals = [s for s in signals if s.signal == "BUY" and s.above_vwap]
 
     # Deduplicate: best confidence per index
     best: dict[int, PatternSignal] = {}

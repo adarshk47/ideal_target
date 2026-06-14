@@ -1184,6 +1184,70 @@ def _apply_multi_factor(signals: List[PatternSignal], df: pd.DataFrame,
     return enhanced
 
 
+# ─── Session Regime Filter ────────────────────────────────────────────────────
+
+def _is_bull_regime(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray,
+                     ema9: np.ndarray, ema21: np.ndarray, vwap: np.ndarray,
+                     atr: np.ndarray, i: int, lookback: int = 5) -> bool:
+    """
+    Hard pre-trade checklist — ALL 4 must pass before any BUY fires.
+
+    Big traders don't take a trade just because a candle pattern appeared.
+    They first confirm the SESSION ENVIRONMENT is favourable. This function
+    answers: "Is the wind blowing in our direction RIGHT NOW?"
+
+    Check 1 — EMA stack persistent:
+        EMA9 > EMA21 for every one of the last `lookback` bars.
+        A single bar cross doesn't count. We need a CONFIRMED trend.
+        (eliminates all morning / choppy signals)
+
+    Check 2 — Price above VWAP:
+        Institutions accumulate above VWAP, distribute below.
+        Buying below VWAP = fighting the smart money.
+
+    Check 3 — Positive momentum (20-bar linear regression slope > 0):
+        Even if EMAs are aligned today, is the price ACTUALLY moving up?
+        Catches sideways days where EMAs happen to be stacked but no edge.
+
+    Check 4 — Higher-lows structure in last 8 bars:
+        Price must not have made a fresh lower low recently.
+        This blocks 'catch-the-falling-knife' type early reversals —
+        the Double Bottoms / Morning Stars that keep firing during a dip.
+    """
+    if i < max(lookback + 1, 22):
+        return False
+
+    # Check 1: EMA9 > EMA21 for last `lookback` consecutive bars
+    for j in range(i - lookback + 1, i + 1):
+        if np.isnan(ema9[j]) or np.isnan(ema21[j]):
+            return False
+        if ema9[j] <= ema21[j]:
+            return False          # trend not yet established
+
+    # Check 2: Current price above VWAP
+    if not np.isnan(vwap[i]) and closes[i] < vwap[i]:
+        return False
+
+    # Check 3: Positive momentum — 20-bar linear regression slope
+    y = closes[max(0, i - 19):i + 1]
+    if len(y) >= 10:
+        slope = np.polyfit(range(len(y)), y, 1)[0]
+        if slope <= 0:
+            return False          # price drifting sideways or down
+
+    # Check 4: No fresh lower lows in last 8 bars
+    #   Compare mean of first-half lows vs second-half lows —
+    #   second half must NOT be lower (would mean breakdown in progress)
+    win = lows[max(0, i - 7):i + 1]
+    if len(win) >= 6:
+        mid = len(win) // 2
+        atr_v = atr[i] if (not np.isnan(atr[i]) and atr[i] > 0) else 1.0
+        if np.mean(win[mid:]) < np.mean(win[:mid]) - 0.15 * atr_v:
+            return False          # price structure still trending lower
+
+    return True
+
+
 # ─── Main Entry Point ─────────────────────────────────────────────────────────
 
 def detect_all_patterns(df: pd.DataFrame, buy_only: bool = True) -> List[PatternSignal]:
@@ -1258,6 +1322,18 @@ def detect_all_patterns(df: pd.DataFrame, buy_only: bool = True) -> List[Pattern
     if buy_only:
         signals = [s for s in signals if s.signal == "BUY" and s.above_vwap]
 
+    # ── SESSION REGIME GATE (hardest filter) ─────────────────────────────────
+    # A pattern is meaningless without the right environment. Every remaining
+    # signal must pass all 4 regime checks (persistent EMA stack, above VWAP,
+    # positive momentum, higher-lows structure).  This is what eliminates the
+    # morning-dip hammers, early double-bottoms and choppy inside bars.
+    h_arr = df["high"].values.astype(float)
+    l_arr = df["low"].values.astype(float)
+    signals = [
+        s for s in signals
+        if _is_bull_regime(closes_arr, h_arr, l_arr, ema9, ema21, vwap, atr, s.index)
+    ]
+
     # Deduplicate: best confidence per index
     best: dict[int, PatternSignal] = {}
     for sig in signals:
@@ -1267,14 +1343,26 @@ def detect_all_patterns(df: pd.DataFrame, buy_only: bool = True) -> List[Pattern
     # Sort by bar index
     sorted_sigs = sorted(best.values(), key=lambda x: x.index)
 
-    # Suppress consecutive same-direction signals within 3 bars
-    filtered: List[PatternSignal] = []
+    # Two-pass deduplication so only clean, spaced entries reach the user:
+    # Pass 1 — same PATTERN name: keep only the first occurrence per 10-bar window.
+    #           This removes the same Double Bottom / Ascending Triangle appearing
+    #           repeatedly as the sliding window advances.
+    pattern_last: dict[str, int] = {}
+    pass1: List[PatternSignal] = []
     for sig in sorted_sigs:
+        last_idx = pattern_last.get(sig.pattern, -999)
+        if sig.index - last_idx >= 10:
+            pass1.append(sig)
+            pattern_last[sig.pattern] = sig.index
+
+    # Pass 2 — any same-direction signal within 5 bars: keep highest confidence.
+    filtered: List[PatternSignal] = []
+    for sig in pass1:
         if not filtered:
             filtered.append(sig)
             continue
         last = filtered[-1]
-        if sig.index - last.index < 3 and sig.signal == last.signal:
+        if sig.index - last.index < 5 and sig.signal == last.signal:
             if sig.confidence > last.confidence:
                 filtered[-1] = sig
         else:

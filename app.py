@@ -599,7 +599,8 @@ def render_recommendations_tab(patterns, spot: float, instrument: str = "NIFTY")
         st.rerun()
 
 
-def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_by_tf: dict):
+def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_by_tf: dict,
+                             instrument: str = "NIFTY"):
     st.markdown("### 🎯 Most Traded Strikes – ATM ±5")
     if options_df is None or options_df.empty:
         st.warning(f"Options data unavailable — {get_options_diagnostic()}")
@@ -608,7 +609,8 @@ def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_
     tf_col, _ = st.columns([1, 3])
     with tf_col:
         selected_tf = st.selectbox("Timeframe", [1, 2, 5, 10, 15, 30, 60], index=2,
-                                   key="strike_tf_select", format_func=lambda x: f"{x} min")
+                                   key=f"strike_tf_select_{instrument}",
+                                   format_func=lambda x: f"{x} min")
 
     strike_df = build_strike_volume_table(options_df, candle_data_by_tf, spot, n_strikes=5)
     if not strike_df.empty:
@@ -1004,9 +1006,9 @@ def _patterns_to_df(patterns) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def render_intraday_expiry_section(expiry_dt):
+def render_intraday_expiry_section(expiry_dt, instrument: str = "NIFTY"):
     """
-    Fetch 5-min NIFTY candles for a user date range from AngelOne, detect the
+    Fetch 5-min candles for a user date range from AngelOne, detect the
     expiry days inside it, render each expiry day's intraday chart + detected
     chart patterns, and let the user export the candle data and the patterns.
     """
@@ -1015,39 +1017,40 @@ def render_intraday_expiry_section(expiry_dt):
         st.info("🔌 Connect to AngelOne (top of page) to fetch intraday 5-min history.")
         return
 
+    k = instrument  # short alias for session state keys
     today = get_now().date()
     cda, cdb, cdc, cdd = st.columns([2, 2, 1.5, 1.5])
     with cda:
         d_from = st.date_input("From date", value=today - timedelta(days=90),
-                               max_value=today, key="exp_intraday_from")
+                               max_value=today, key=f"exp_intraday_from_{k}")
     with cdb:
         d_to = st.date_input("To date", value=today, max_value=today,
-                             key="exp_intraday_to")
+                             key=f"exp_intraday_to_{k}")
     with cdc:
         tf_choice = st.selectbox("Interval", [5, 1, 2, 3, 10, 15],
-                                 index=0, key="exp_intraday_tf",
+                                 index=0, key=f"exp_intraday_tf_{k}",
                                  format_func=lambda x: f"{x} min")
     with cdd:
         st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
         fetch_clicked = st.button("⬇️ Fetch", type="primary",
-                                  use_container_width=True, key="exp_intraday_fetch")
+                                  use_container_width=True, key=f"exp_intraday_fetch_{k}")
 
     if fetch_clicked:
-        with st.spinner(f"Fetching {tf_choice}-min NIFTY {d_from} → {d_to} (chunked)…"):
+        with st.spinner(f"Fetching {tf_choice}-min {instrument} {d_from} → {d_to} (chunked)…"):
             rng_df = fetch_candle_range(tf_choice, d_from.strftime("%Y-%m-%d"),
                                         d_to.strftime("%Y-%m-%d"))
         if rng_df is None or rng_df.empty:
             st.error("No data returned. Check the date range / connection. "
                      "5-min history is capped at 100 days per request (auto-chunked).")
         else:
-            st.session_state["intraday_range_df"] = rng_df
-            st.session_state["intraday_range_tf"] = tf_choice
+            st.session_state[f"intraday_range_df_{k}"] = rng_df
+            st.session_state[f"intraday_range_tf_{k}"] = tf_choice
 
-    rng_df = st.session_state.get("intraday_range_df")
+    rng_df = st.session_state.get(f"intraday_range_df_{k}")
     if rng_df is None or rng_df.empty:
         return
 
-    tf_used = st.session_state.get("intraday_range_tf", 5)
+    tf_used = st.session_state.get(f"intraday_range_tf_{k}", 5)
     rng_df = rng_df.copy()
     rng_df["d"] = pd.to_datetime(rng_df["timestamp"]).dt.date
 
@@ -1064,8 +1067,8 @@ def render_intraday_expiry_section(expiry_dt):
     # Full-range CSV export
     csv_all = rng_df.drop(columns=["d"]).to_csv(index=False).encode()
     st.download_button("📥 Export full range (CSV)", csv_all,
-                       file_name=f"nifty_{tf_used}min_{d_from}_{d_to}.csv",
-                       mime="text/csv", key="dl_range_all")
+                       file_name=f"{instrument.lower()}_{tf_used}min_{d_from}_{d_to}.csv",
+                       mime="text/csv", key=f"dl_range_all_{k}")
 
     if not expiry_dates:
         st.info("No expiry days fall inside this range.")
@@ -1075,7 +1078,7 @@ def render_intraday_expiry_section(expiry_dt):
         "Select an expiry day to view its intraday chart & pattern",
         options=list(reversed(expiry_dates)),
         format_func=lambda d: f"{d.strftime('%d %b %Y (%a)')}  ·  expiry",
-        key="exp_intraday_day",
+        key=f"exp_intraday_day_{k}",
     )
     day_df = rng_df[rng_df["d"] == sel].drop(columns=["d"]).reset_index(drop=True)
     if day_df.empty or len(day_df) < 3:
@@ -1112,7 +1115,7 @@ def render_intraday_expiry_section(expiry_dt):
     # Intraday chart with pattern markers
     fig_day = build_chart(day_df, day_patterns, [], tf_used)
     fig_day.update_layout(title=dict(
-        text=f"NIFTY {tf_used}-min — Expiry {sel.strftime('%d %b %Y')}",
+        text=f"{instrument} {tf_used}-min — Expiry {sel.strftime('%d %b %Y')}",
         font=dict(size=14, color="#fff")))
     st.plotly_chart(fig_day, use_container_width=True,
                     config={"displaylogo": False})
@@ -1131,14 +1134,14 @@ def render_intraday_expiry_section(expiry_dt):
             "📥 Export this day's candles (CSV)",
             day_df.to_csv(index=False).encode(),
             file_name=f"nifty_{tf_used}min_expiry_{sel}.csv",
-            mime="text/csv", key="dl_day_candles")
+            mime="text/csv", key=f"dl_day_candles_{k}")
     with e2:
         if not pat_df.empty:
             st.download_button(
                 "📥 Export this day's patterns (CSV)",
                 pat_df.to_csv(index=False).encode(),
-                file_name=f"nifty_patterns_expiry_{sel}.csv",
-                mime="text/csv", key="dl_day_patterns")
+                file_name=f"{instrument.lower()}_patterns_expiry_{sel}.csv",
+                mime="text/csv", key=f"dl_day_patterns_{k}")
 
     # All-expiry-days summary export across the whole fetched range
     with st.expander("📦 Export ALL expiry days in range (summary + patterns)"):
@@ -1175,19 +1178,20 @@ def render_intraday_expiry_section(expiry_dt):
                 "📥 Export expiry-day summary (CSV)",
                 summ_df.to_csv(index=False).encode(),
                 file_name=f"nifty_expiry_summary_{d_from}_{d_to}.csv",
-                mime="text/csv", key="dl_exp_summary")
+                mime="text/csv", key=f"dl_exp_summary_{k}")
             if all_pat_rows:
                 all_pat = pd.concat(all_pat_rows, ignore_index=True)
                 st.download_button(
                     "📥 Export ALL expiry-day patterns (CSV)",
                     all_pat.to_csv(index=False).encode(),
-                    file_name=f"nifty_expiry_patterns_{d_from}_{d_to}.csv",
-                    mime="text/csv", key="dl_exp_all_patterns")
+                    file_name=f"{instrument.lower()}_expiry_patterns_{d_from}_{d_to}.csv",
+                    mime="text/csv", key=f"dl_exp_all_patterns_{k}")
 
     st.markdown("<hr style='border-color:#2d3250;margin:10px 0;'>", unsafe_allow_html=True)
 
 
-def render_expiry_analysis_tab(wide_candle_df: pd.DataFrame, spot: float, expiry_dt):
+def render_expiry_analysis_tab(wide_candle_df: pd.DataFrame, spot: float, expiry_dt,
+                               instrument: str = "NIFTY"):
     """
     Expiry-day analysis + current expiry prediction.
     Two parts:
@@ -1213,7 +1217,8 @@ def render_expiry_analysis_tab(wide_candle_df: pd.DataFrame, spot: float, expiry
 - Date formats accepted: `YYYY-MM-DD`, `DD-MM-YYYY`, `DD/MM/YYYY`, `DD-Mon-YYYY`
 - Download from NSE Bhavcopy, Kite export, TradingView, or any broker
         """)
-        uploaded = st.file_uploader("Choose CSV file", type=["csv"], key="expiry_hist_upload")
+        uploaded = st.file_uploader("Choose CSV file", type=["csv"],
+                                    key=f"expiry_hist_upload_{instrument}")
         if uploaded is not None:
             try:
                 raw = pd.read_csv(uploaded)
@@ -1256,7 +1261,7 @@ def render_expiry_analysis_tab(wide_candle_df: pd.DataFrame, spot: float, expiry
                 st.error(f"Error reading CSV: {e}")
 
     # ── Part 1: live intraday 5-min expiry-day charts + export (no CSV needed)
-    render_intraday_expiry_section(expiry_dt)
+    render_intraday_expiry_section(expiry_dt, instrument=instrument)
 
     # ── Part 2: multi-year daily analysis & prediction (needs uploaded CSV) ──
     st.markdown("#### 📚 Multi-Year Historical Expiry Analysis & Prediction")
@@ -1500,7 +1505,7 @@ def render_expiry_analysis_tab(wide_candle_df: pd.DataFrame, spot: float, expiry
         )
         st.dataframe(st2, use_container_width=True, hide_index=True)
 
-    if st.button("🗑️ Clear uploaded data", key="clear_hist_data"):
+    if st.button("🗑️ Clear uploaded data", key=f"clear_hist_data_{instrument}"):
         st.session_state.pop("expiry_hist_df", None)
         st.rerun()
 
@@ -1729,7 +1734,7 @@ def _render_instrument_section(instrument: str, selected_tf: int):
     with t1:
         render_recommendations_tab(patterns, spot, instrument=instrument)
     with t2:
-        render_strike_volume_tab(options_df, spot, candle_data_by_tf)
+        render_strike_volume_tab(options_df, spot, candle_data_by_tf, instrument=instrument)
     with t3:
         render_paper_trade_tab(patterns, spot, options_df=options_df,
                                candle_df=candle_df, instrument=instrument)
@@ -1740,7 +1745,7 @@ def _render_instrument_section(instrument: str, selected_tf: int):
     with t6:
         render_best_trade_tab(patterns, options_df, spot, oi_delta, greeks_result)
     with t7:
-        render_expiry_analysis_tab(candle_df_wide, spot, expiry_dt)
+        render_expiry_analysis_tab(candle_df_wide, spot, expiry_dt, instrument=instrument)
 
 
 def main():

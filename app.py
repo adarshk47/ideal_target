@@ -306,6 +306,51 @@ def _pick_active_signal(selected):
     return selected[-1][1][1]
 
 
+def _chart_vwap(candle_df: pd.DataFrame) -> np.ndarray:
+    """Cumulative VWAP for the session (returns NaN array when no volume)."""
+    if "volume" not in candle_df.columns:
+        return np.full(len(candle_df), np.nan)
+    vol = candle_df["volume"].values.astype(float)
+    vol = np.where(vol == 0, np.nan, vol)
+    tp  = ((candle_df["high"] + candle_df["low"] + candle_df["close"]) / 3).values
+    cumvol   = np.nancumsum(vol)
+    cumtpvol = np.nancumsum(tp * np.where(np.isnan(vol), 0.0, vol))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(cumvol > 0, cumtpvol / cumvol, np.nan)
+
+
+def _chart_regime_zones(candle_df: pd.DataFrame) -> list:
+    """
+    Return list of (start_idx, end_idx) contiguous bars where the
+    bull-regime conditions are all met — used to shade the chart background
+    so the trader can see at a glance WHEN we're allowed to trade.
+    """
+    try:
+        from modules.pattern_detector import (
+            _is_bull_regime, _compute_ema, _compute_atr, _compute_vwap,
+        )
+        c  = candle_df["close"].values.astype(float)
+        h  = candle_df["high"].values.astype(float)
+        l  = candle_df["low"].values.astype(float)
+        e9  = _compute_ema(c, 9)
+        e21 = _compute_ema(c, 21)
+        vw  = _compute_vwap(candle_df)
+        at  = _compute_atr(candle_df)
+        zones, z_start = [], None
+        for i in range(len(candle_df)):
+            active = _is_bull_regime(c, h, l, e9, e21, vw, at, i)
+            if active and z_start is None:
+                z_start = i
+            elif not active and z_start is not None:
+                zones.append((z_start, i - 1))
+                z_start = None
+        if z_start is not None:
+            zones.append((z_start, len(candle_df) - 1))
+        return zones
+    except Exception:
+        return []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CHART
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,9 +392,9 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
     ), row=1, col=1)
 
     # EMA 9 & EMA 21 overlays
+    ema9 = candle_df["close"].ewm(span=9, adjust=False).mean()
+    ema21 = candle_df["close"].ewm(span=21, adjust=False).mean()
     if len(candle_df) >= 2:
-        ema9 = candle_df["close"].ewm(span=9, adjust=False).mean()
-        ema21 = candle_df["close"].ewm(span=21, adjust=False).mean()
         fig.add_trace(go.Scatter(
             x=candle_df["timestamp"], y=ema9, mode="lines",
             line=dict(color="#ffaa00", width=1.4), name="EMA 9",
@@ -358,6 +403,39 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
             x=candle_df["timestamp"], y=ema21, mode="lines",
             line=dict(color="#33b5ff", width=1.4), name="EMA 21",
         ), row=1, col=1)
+
+    # ── VWAP ─────────────────────────────────────────────────────────────────
+    # The most important institutional price anchor. Regime filter requires
+    # price to be above VWAP, so we draw it so the trader sees why/when
+    # signals fire.
+    vwap_vals = _chart_vwap(candle_df)
+    if not np.all(np.isnan(vwap_vals)):
+        fig.add_trace(go.Scatter(
+            x=candle_df["timestamp"], y=vwap_vals, mode="lines",
+            line=dict(color="#ff9900", width=2.0, dash="dot"),
+            name="VWAP", opacity=0.90,
+        ), row=1, col=1)
+        # VWAP label on right edge
+        last_vwap = next((v for v in reversed(vwap_vals) if not np.isnan(v)), None)
+        if last_vwap:
+            fig.add_annotation(
+                x=candle_df["timestamp"].iloc[-1], y=last_vwap,
+                text=f"V {last_vwap:.0f}", showarrow=False, xanchor="left",
+                font=dict(color="#ff9900", size=9), row=1, col=1,
+            )
+
+    # ── Bull-regime background shading ───────────────────────────────────────
+    # Pale-green strip during bars where all 4 regime conditions hold
+    # (persistent EMA stack, above VWAP, positive momentum, higher lows).
+    # This makes it visually obvious WHY signals only appear in afternoon.
+    for z_s, z_e in _chart_regime_zones(candle_df):
+        if z_s < len(candle_df) and z_e < len(candle_df):
+            fig.add_vrect(
+                x0=candle_df["timestamp"].iloc[z_s],
+                x1=candle_df["timestamp"].iloc[z_e],
+                fillcolor="rgba(0,255,136,0.05)",
+                layer="below", line_width=0,
+            )
 
     # Support / Resistance levels
     supports, resistances = _find_support_resistance(candle_df)
@@ -449,9 +527,53 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
         showlegend=False,
     ), row=2, col=1)
 
-    # Pattern markers — deduped & capped so the chart stays readable.
-    # Keep only the highest-confidence pattern per bar, then show the most
-    # recent ones (clutter from 40+ overlapping labels otherwise).
+    # ── Special pattern overlays (drawn BEFORE generic markers) ─────────────
+
+    # Darvas Box: draw the consolidation rectangle for Range Breakout signals
+    for pat in patterns:
+        pname = getattr(pat, "pattern", "")
+        if "Range Breakout" in pname:
+            i = getattr(pat, "index", -1)
+            if i < 1 or i >= len(candle_df):
+                continue
+            look = min(8, i)
+            box_s = i - look
+            box_h = float(candle_df["high"].iloc[box_s:i].max())
+            box_l = float(candle_df["low"].iloc[box_s:i].min())
+            t_box_s = candle_df["timestamp"].iloc[box_s]
+            t_box_e = candle_df["timestamp"].iloc[i]
+            fig.add_shape(
+                type="rect",
+                x0=t_box_s, x1=t_box_e, y0=box_l, y1=box_h,
+                fillcolor="rgba(255,215,0,0.08)",
+                line=dict(color="#ffd700", width=1.5, dash="dash"),
+                row=1, col=1,
+            )
+            fig.add_annotation(
+                x=t_box_s, y=box_h,
+                text="📦 Breakout Zone", showarrow=False, xanchor="left",
+                font=dict(color="#ffd700", size=9),
+                bgcolor="rgba(0,0,0,0.55)", row=1, col=1,
+            )
+
+    # EMA Pullback: orange circle at the pullback point on EMA9
+    for pat in patterns:
+        if "EMA Pullback" in getattr(pat, "pattern", ""):
+            i = getattr(pat, "index", -1)
+            if 1 <= i < len(candle_df) and i < len(ema9):
+                fig.add_trace(go.Scatter(
+                    x=[candle_df["timestamp"].iloc[i - 1]],
+                    y=[float(ema9.iloc[i - 1])],
+                    mode="markers",
+                    marker=dict(symbol="circle", size=11, color="#ffaa00",
+                                line=dict(color="#fff", width=1.5)),
+                    name="EMA Pullback", showlegend=False,
+                    hovertemplate="EMA9 Pullback<extra></extra>",
+                ), row=1, col=1)
+
+    # ── Pattern markers — all regime-filtered signals ─────────────────────────
+    # Show ALL signals that passed the regime gate (not just last 5),
+    # capped at 8 most recent so chart stays readable.
     def _conf_score(p):
         c = getattr(p, "confidence", 0.5)
         if isinstance(c, str):
@@ -467,30 +589,29 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
         if idx not in best_per_bar or score > best_per_bar[idx][0]:
             best_per_bar[idx] = (score, pat)
 
-    # Most recent 5 bars with a pattern (sorted by bar index) — keeps chart readable
-    selected = sorted(best_per_bar.items())[-5:]
+    # Last 8 unique bars with signals
+    selected = sorted(best_per_bar.items())[-8:]
 
     buy_x, buy_y, buy_text = [], [], []
     sell_x, sell_y, sell_text = [], [], []
     for idx, (_, pat) in selected:
-        ts = candle_df["timestamp"].iloc[idx]
+        ts_pt = candle_df["timestamp"].iloc[idx]
         pname = getattr(pat, "pattern", getattr(pat, "name", str(pat)))
         label = f"{pname} (RR {pat.risk_reward})"
-        # Stagger label offset using ATR-like spacing to avoid overlap
         rng = float(candle_df["high"].iloc[idx] - candle_df["low"].iloc[idx]) or 5
         if pat.signal == "BUY":
-            buy_x.append(ts)
-            buy_y.append(candle_df["low"].iloc[idx] - rng * 0.8)
+            buy_x.append(ts_pt)
+            buy_y.append(candle_df["low"].iloc[idx] - rng * 1.0)
             buy_text.append(label)
         else:
-            sell_x.append(ts)
-            sell_y.append(candle_df["high"].iloc[idx] + rng * 0.8)
+            sell_x.append(ts_pt)
+            sell_y.append(candle_df["high"].iloc[idx] + rng * 1.0)
             sell_text.append(label)
 
     if buy_x:
         fig.add_trace(go.Scatter(
             x=buy_x, y=buy_y, mode="markers+text",
-            marker=dict(symbol="triangle-up", size=14, color="#00ff88"),
+            marker=dict(symbol="triangle-up", size=15, color="#00ff88"),
             text=buy_text, textposition="bottom center",
             textfont=dict(size=9, color="#00ff88"),
             name="BUY Signal", showlegend=True,
@@ -499,7 +620,7 @@ def build_chart(candle_df: pd.DataFrame, patterns, oi_annotations, tf_minutes: i
     if sell_x:
         fig.add_trace(go.Scatter(
             x=sell_x, y=sell_y, mode="markers+text",
-            marker=dict(symbol="triangle-down", size=14, color="#ff4444"),
+            marker=dict(symbol="triangle-down", size=15, color="#ff4444"),
             text=sell_text, textposition="top center",
             textfont=dict(size=9, color="#ff4444"),
             name="SELL Signal", showlegend=True,
@@ -1743,7 +1864,17 @@ def _render_instrument_section(instrument: str, selected_tf: int):
             st.info("🔌 Connect to AngelOne (top of page) to load live data.")
         return
 
-    # Pattern detection
+    # ── Timeframe-awareness: if user switched TF, reset paper trades so they
+    # re-generate from new TF data (1-min → 1-min signals, 5-min → 5-min). ──
+    tf_state_key = f"_last_tf_{instrument}"
+    if st.session_state.get(tf_state_key) != selected_tf:
+        try:
+            clear_all_trades(instrument)
+        except Exception:
+            pass
+        st.session_state[tf_state_key] = selected_tf
+
+    # Pattern detection on the current TF candles
     patterns = []
     if candle_df is not None and not candle_df.empty:
         try:
